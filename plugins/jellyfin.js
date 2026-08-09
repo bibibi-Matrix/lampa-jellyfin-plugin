@@ -47,11 +47,14 @@
   var ROUTE_CACHE_KEY = STORAGE_PREFIX + 'Route';
   var ROUTE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
   var ROUTE_MAX_DEPTH = 24;
+  var RESTORE_MAX_DEPTH = 5;
+  var RESTORE_STEP_DELAY = 120;
   var routeStack = [];
   var routeCacheStoreKey = '';
   var routePending = false;
   var routeRestored = false;
   var routeRebuilding = false;
+  var routeRestorePending = false;
   var routePendingTimer = null;
   var routeAdoptStrong = false;
   var routeAdoptTopSig = '';
@@ -76,7 +79,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 4',
+    version: '2.0.0 Beta 5',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -4709,6 +4712,19 @@
     return false;
   }
 
+  function isPageReload() {
+    try {
+      var nav = window.performance && window.performance.navigation;
+      if (nav && typeof nav.type === 'number') return nav.type === 1;
+      var entries =
+        window.performance &&
+        window.performance.getEntriesByType &&
+        window.performance.getEntriesByType('navigation');
+      if (entries && entries[0] && entries[0].type) return entries[0].type === 'reload';
+    } catch (e) {}
+    return false;
+  }
+
   var jellyfinResumeKeys = [
     'url', 'title', 'component', 'category', 'libraryId', 'library',
     'homeMedia', 'musicMedia', 'page', 'path', 'parentId',
@@ -4905,6 +4921,97 @@
     return readViewerResumeTarget();
   }
 
+  function savedTopMatches(active) {
+    if (!active) return false;
+    try {
+      var saved = loadRouteCache();
+      if (!saved || !saved.length) return false;
+      var top = saved[saved.length - 1];
+      return !!top && routeSig(top) === routeSig(active);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function markRouteRestoreDone() {
+    setTimeout(function () {
+      routeRestorePending = false;
+    }, 0);
+  }
+
+  function restoreRouteAfterRefresh(active) {
+    try {
+      var saved = loadRouteCache();
+      if (!saved || !saved.length) return false;
+
+      var stack = cleanRouteStack(saved);
+      while (
+        stack.length &&
+        String(stack[stack.length - 1].component) === EPISODES_COMPONENT
+      ) {
+        stack.pop();
+      }
+      if (!stack.length) return false;
+      var top = stack[stack.length - 1];
+      if (!top || !top.component) return false;
+
+      if (jellyfinResumeHandled) return true;
+      jellyfinResumeHandled = true;
+      routeRestorePending = true;
+
+      cancelRoutePending();
+      if (stack.length > RESTORE_MAX_DEPTH) {
+        stack = stack.slice(stack.length - RESTORE_MAX_DEPTH);
+      }
+      routeStack = stack;
+      routeRestored = true;
+      persistRoute();
+
+      restoreRouteStack(stack);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function restoreRouteStack(stack) {
+    var i = 0;
+    function next() {
+      if (routeRebuilding) {
+        setTimeout(next, RESTORE_STEP_DELAY);
+        return;
+      }
+      if (i >= stack.length) {
+        markRouteRestoreDone();
+        return;
+      }
+      var entry = stack[i];
+      var isFirst = i === 0;
+      i++;
+      if (String(entry.component) === 'full') {
+        jellyfinResumeCardObject(entry).then(function (object) {
+          openRestoredPage(object || entry, isFirst);
+          setTimeout(next, RESTORE_STEP_DELAY);
+        });
+      } else {
+        openRestoredPage(entry, isFirst);
+        setTimeout(next, RESTORE_STEP_DELAY);
+      }
+    }
+    next();
+  }
+
+  function openRestoredPage(object, isFirst) {
+    try {
+      if (!object || !object.component) return;
+      if (isFirst) {
+        Lampa.Activity.replace(object, true);
+      } else {
+        Lampa.Activity.push(object);
+      }
+    } catch (e) {}
+  }
+
   function resumeJellyfinActivity() {
     try {
       var active = Lampa.Activity.active && Lampa.Activity.active();
@@ -4925,11 +5032,24 @@
       }
 
       var navUrl = getOriginalNavUrl();
-      if (!urlIsJellyfin(navUrl)) return;
+      var sNav = String(navUrl || '');
+      var isPhotoNav = sNav.indexOf('jellyfin%2Fphoto') !== -1 || sNav.indexOf('jellyfin/photo') !== -1;
+      var isAudioNav = sNav.indexOf('jellyfin%2Faudio') !== -1 || sNav.indexOf('jellyfin/audio') !== -1;
 
       var viewerTarget = resumeViewerIfNeeded(navUrl);
       if (viewerTarget) {
         finishJellyfinResume(viewerTarget);
+        return;
+      }
+
+      if (!isPhotoNav && !isAudioNav) {
+        if (isPageReload() || urlIsJellyfin(navUrl) || savedTopMatches(active)) {
+          if (restoreRouteAfterRefresh(active)) return;
+        }
+      }
+
+      if (!urlIsJellyfin(navUrl)) {
+        jellyfinResumeHandled = true;
         return;
       }
 
@@ -4940,10 +5060,14 @@
           stored = Lampa.Storage.get('activity', false);
         }
       } catch (e) {
+        jellyfinResumeHandled = true;
         return;
       }
       var object = buildResumeObject(stored);
-      if (!object) return;
+      if (!object) {
+        jellyfinResumeHandled = true;
+        return;
+      }
 
       if (String(object.component) === AUDIO_PLAYER_COMPONENT) {
         finishJellyfinResume(object);
@@ -4956,6 +5080,16 @@
         (object.source === 'jellyfin' || (object.card && object.card.source === 'jellyfin'))
       ) {
         target = object;
+      } else if (String(object.component) === EPISODES_COMPONENT && object.seriesId) {
+        target = {
+          url: jellyfinNavUrl(['jellyfin', 'card', 'tv', object.seriesId]),
+          title: object.seriesTitle || object.title || '',
+          component: 'full',
+          id: object.seriesId,
+          method: 'tv',
+          source: 'jellyfin',
+          card: { id: String(object.seriesId), source: 'jellyfin' },
+        };
       }
 
       if (!target) {
@@ -5042,7 +5176,13 @@
 
   function routeSig(act) {
     var a = act || {};
-    return String(a.url || a.component || '');
+    var comp = String(a.component || '');
+    if (comp === 'full') {
+      var method = String(a.method || (a.card && a.card.method) || '');
+      var id = String(a.id || (a.card && a.card.id) || '');
+      if (method || id) return 'full:' + method + ':' + id;
+    }
+    return String(a.url || comp || '');
   }
 
   function routeCompact(act) {
@@ -5129,25 +5269,11 @@
     var navUrl = getOriginalNavUrl();
     if (urlIsJellyfin(navUrl)) {
       routeAdoptStrong = true;
+    } else if (!isPageReload()) {
+      cancelRoutePending();
+      return;
     } else {
       routeAdoptStrong = false;
-      var reloaded = false;
-      try {
-        var nav = window.performance && window.performance.navigation;
-        if (nav && typeof nav.type === 'number') {
-          reloaded = nav.type === 1;
-        } else {
-          var entries =
-            window.performance &&
-            window.performance.getEntriesByType &&
-            window.performance.getEntriesByType('navigation');
-          if (entries && entries[0] && entries[0].type) reloaded = entries[0].type === 'reload';
-        }
-      } catch (e) {}
-      if (!reloaded) {
-        cancelRoutePending();
-        return;
-      }
     }
     routePending = true;
     routePendingTimer = setTimeout(function () {
@@ -5216,6 +5342,7 @@
 
   function trackRouteActivity(act) {
     if (routeRebuilding) return;
+    if (routeRestorePending) return;
     if (!act || typeof act !== 'object') return;
 
     if (isRouteActivity(act)) {
@@ -5258,6 +5385,7 @@
 
     if (isTransientViewer(act)) return;
     if (routePending) return;
+    if (routeRestorePending) return;
     clearRouteCache();
   }
 
@@ -5302,7 +5430,7 @@
       if (activity && activity.listener && typeof activity.listener.follow === 'function') {
         activity.listener.follow('backward', function (e) {
           if (!e || routeRebuilding) return;
-          if (e.count !== 1) {
+          if (e.count > 1) {
             if (routeStack.length > 1) {
               var active = activity.active && activity.active();
               if (active && routeSig(routeStack[routeStack.length - 1]) === routeSig(active)) {
@@ -5312,7 +5440,18 @@
             }
             return;
           }
-          if (routeRestored) routeBack();
+          if (routeRestored && routeStack.length === 1) {
+            var active = activity.active && activity.active();
+            if (active && routeSig(routeStack[0]) === routeSig(active)) {
+              clearRouteCache();
+              routeRebuilding = true;
+              try {
+                Lampa.Activity.replace(mainActivityObject(), true);
+              } finally {
+                routeRebuilding = false;
+              }
+            }
+          }
         });
       }
     } catch (err) {}
