@@ -59,6 +59,7 @@
   var routeAdoptStrong = false;
   var routeAdoptTopSig = '';
   var audioReturnTarget = null;
+  var photoReturnTarget = null;
   var jellyfinResumeHandled = false;
   var jellyfinLoadUrl = '';
   try {
@@ -79,7 +80,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 5',
+    version: '2.0.0 Beta 6',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -140,6 +141,7 @@
   function addLang() {
     Lampa.Lang.add({
       jellyfin_title: { en: 'Jellyfin', ru: 'Jellyfin' },
+      jellyfin_home: { en: 'Main - Jellyfin', ru: 'Главная - Jellyfin' },
       jellyfin_movies: { en: 'Movies', ru: 'Фильмы' },
       jellyfin_series: { en: 'TV Series', ru: 'Сериалы' },
       jellyfin_resume: { en: 'Continue watching', ru: 'Продолжить просмотр' },
@@ -1881,6 +1883,42 @@
     return detectQuality(item.Name);
   }
 
+  function musicFormatFromStream(stream, container, sourceBitrate) {
+    if (!stream) stream = {};
+    var parts = [];
+    var codec = String(stream.Codec || stream.codec || '').trim().toUpperCase();
+    if (!codec && container) codec = String(container).trim().toUpperCase();
+    if (codec) parts.push(codec);
+    var bits = Number(stream.BitsPerSample) || 0;
+    var bitrate = Number(stream.BitRate) || Number(sourceBitrate) || 0;
+    var sample = Number(stream.SampleRate) || 0;
+    if (bits) parts.push(bits + '-bit');
+    if (bitrate) {
+      parts.push(Math.max(1, Math.round(bitrate / 1000)) + 'kbps');
+    } else if (sample) {
+      parts.push(sample >= 1000 ? Math.round(sample / 1000) + 'kHz' : sample + 'Hz');
+    }
+    return parts.join(' ');
+  }
+
+  function musicFormatFromItem(item) {
+    if (!item) return '';
+    if (item.Type !== 'MusicAlbum' && item.Type !== 'Audio') return '';
+    var sources = item.MediaSources || [];
+    var labels = [];
+    for (var i = 0; i < sources.length; i++) {
+      var container = sources[i] && sources[i].Container;
+      var sourceBitrate = sources[i] && sources[i].Bitrate;
+      var streams = (sources[i] && sources[i].MediaStreams) || [];
+      for (var j = 0; j < streams.length; j++) {
+        if (!streams[j] || streams[j].Type !== 'Audio') continue;
+        var label = musicFormatFromStream(streams[j], container, sourceBitrate);
+        if (label && labels.indexOf(label) < 0) labels.push(label);
+      }
+    }
+    return labels.length ? labels.join(' / ') : '';
+  }
+
   function fetchItemMediaSources(itemId) {
     return resolveUserId().then(function (userId) {
       return jfHttp(
@@ -2579,6 +2617,7 @@
       type: item.Type || '',
       tmdb: tmdb,
       quality: qualityLabelFromItem(item),
+      music: musicFormatFromItem(item),
       rating:
         item.CommunityRating && Number(item.CommunityRating) > 0
           ? parseFloat(item.CommunityRating).toFixed(1)
@@ -4623,6 +4662,9 @@
       source: 'tmdb',
       card: { id: String(tmdb.id), source: 'tmdb' },
     });
+    try {
+      Lampa.Activity.mixState('select=open');
+    } catch (e) {}
   }
 
   function compactActivity(act) {
@@ -5032,20 +5074,14 @@
       }
 
       var navUrl = getOriginalNavUrl();
-      var sNav = String(navUrl || '');
-      var isPhotoNav = sNav.indexOf('jellyfin%2Fphoto') !== -1 || sNav.indexOf('jellyfin/photo') !== -1;
-      var isAudioNav = sNav.indexOf('jellyfin%2Faudio') !== -1 || sNav.indexOf('jellyfin/audio') !== -1;
 
       var viewerTarget = resumeViewerIfNeeded(navUrl);
-      if (viewerTarget) {
-        finishJellyfinResume(viewerTarget);
-        return;
+      if (isPageReload() || urlIsJellyfin(navUrl) || savedTopMatches(active)) {
+        if (restoreRouteAfterRefresh(active)) return;
       }
-
-      if (!isPhotoNav && !isAudioNav) {
-        if (isPageReload() || urlIsJellyfin(navUrl) || savedTopMatches(active)) {
-          if (restoreRouteAfterRefresh(active)) return;
-        }
+      if (viewerTarget) {
+        finishJellyfinResumeAsRoute(viewerTarget);
+        return;
       }
 
       if (!urlIsJellyfin(navUrl)) {
@@ -5113,6 +5149,27 @@
     }, 0);
   }
 
+  function finishJellyfinResumeAsRoute(target) {
+    try {
+      var hub = {
+        url: jellyfinNavUrl(['jellyfin', 'home']),
+        title: Lampa.Lang.translate('jellyfin_home'),
+        component: HUB_COMPONENT,
+        page: 1,
+      };
+      var stack = cleanRouteStack([hub, target]);
+      if (stack && stack.length) {
+        routeRestored = true;
+        routeStack = stack;
+        routeRestorePending = true;
+        persistRoute();
+        restoreRouteStack(stack);
+        return;
+      }
+    } catch (e) {}
+    finishJellyfinResume(target);
+  }
+
   function setupBackAfterRefresh() {
     var activity = Lampa.Activity;
     if (!activity || !activity.listener || typeof activity.listener.follow !== 'function') return;
@@ -5131,6 +5188,19 @@
         routeStack.length &&
         routeSig(active) === routeSig(routeStack[routeStack.length - 1])
       ) {
+        return;
+      }
+      var activeComp = String((active && active.component) || '');
+      if (activeComp === AUDIO_PLAYER_COMPONENT || activeComp === PHOTO_VIEWER_COMPONENT) {
+        var vTarget = readViewerResumeTarget();
+        if (vTarget && vTarget.component) {
+          try {
+            Lampa.Storage.remove(VIEWER_RESUME_KEY);
+          } catch (err) {}
+          setTimeout(function () {
+            Lampa.Activity.replace(vTarget, true);
+          }, 0);
+        }
         return;
       }
       var rec = readReturnRecord();
@@ -5695,14 +5765,27 @@
   }
 
   function openSeriesEpisodes(row) {
-    Lampa.Activity.push({
-      url: jellyfinNavUrl(['jellyfin', 'series', row && row.id]),
+    var tmdb = row && row.tmdb;
+    var opts = {
       title: (row && row.title) || '',
       component: EPISODES_COMPONENT,
       seriesId: row && row.id,
       seriesTitle: (row && row.title) || '',
       page: 1,
-    });
+    };
+    if (tmdb) {
+      opts.card = { id: String(tmdb.id), source: 'tmdb' };
+      opts.method = String(tmdb.method || 'tv');
+      opts.source = 'tmdb';
+    } else {
+      opts.url = jellyfinNavUrl(['jellyfin', 'series', row && row.id]);
+    }
+    Lampa.Activity.push(opts);
+    if (tmdb) {
+      try {
+        Lampa.Activity.mixState('select=open');
+      } catch (e) {}
+    }
   }
 
   function applyLocalPlaybackState(row, played, pct, timeSec) {
@@ -6455,6 +6538,124 @@
       });
   }
 
+  var albumMusicLabelCache = {};
+  var albumMusicLabelCards = {};
+  var albumMusicQueue = [];
+  var albumMusicActive = 0;
+  var ALBUM_MUSIC_MAX_CONCURRENCY = 3;
+
+  function setCardMusicBadge($card, label) {
+    if (!label || !$card || !$card.length) return;
+    var $view = $card.find('.card__view');
+    if (!$view.length) return;
+    var $chrome = $view.find('.jellyfin-card-chrome');
+    if (!$chrome.length) {
+      $chrome = $('<div class="jellyfin-card-chrome" aria-hidden="true"></div>');
+      $view.append($chrome);
+    }
+    var $badge = $chrome.find('.jellyfin-badge-music');
+    if (!$badge.length) {
+      $badge = $('<div class="jellyfin-badge jellyfin-badge-music"></div>');
+      $chrome.append($badge);
+    }
+    $badge.text(label);
+  }
+
+  function fetchAlbumMusicLabel(albumId) {
+    if (!albumId) return Promise.resolve('');
+    if (albumMusicLabelCache[albumId]) {
+      return Promise.resolve(albumMusicLabelCache[albumId]);
+    }
+    return fetchAlbumMusicTracks(albumId, false).then(function (label) {
+      if (label) {
+        albumMusicLabelCache[albumId] = label;
+        return label;
+      }
+      return fetchAlbumMusicTracks(albumId, true).then(function (label2) {
+        if (label2) albumMusicLabelCache[albumId] = label2;
+        return label2;
+      });
+    });
+  }
+
+  function fetchAlbumMusicTracks(albumId, recursive) {
+    return resolveUserId()
+      .then(function (userId) {
+        return jfHttp(
+          '/Items?UserId=' +
+          encodeURIComponent(userId) +
+          '&ParentId=' +
+          encodeURIComponent(albumId) +
+          (recursive ? '&Recursive=true' : '&Recursive=false') +
+          '&IncludeItemTypes=Audio&Fields=' +
+          encodeURIComponent('MediaSources') +
+          '&Limit=10&SortBy=' +
+          encodeURIComponent('ParentIndexNumber,IndexNumber') +
+          '&SortOrder=Ascending'
+        ).then(function (data) {
+          var items = ((data && data.Items) || []).filter(function (it) {
+            return it && it.Type === 'Audio';
+          });
+          var label = '';
+          for (var i = 0; i < items.length; i++) {
+            label = musicFormatFromItem(items[i]);
+            if (label) break;
+          }
+          return label;
+        });
+      })
+      .catch(function () {
+        return '';
+      });
+  }
+
+  function pumpAlbumMusicQueue() {
+    while (albumMusicActive < ALBUM_MUSIC_MAX_CONCURRENCY && albumMusicQueue.length) {
+      var job = albumMusicQueue.shift();
+      albumMusicActive++;
+      fetchAlbumMusicLabel(job.albumId)
+        .then(function (label) {
+          job.resolve(label);
+        })
+        .then(function () {
+          albumMusicActive--;
+          pumpAlbumMusicQueue();
+        });
+    }
+  }
+
+  function requestAlbumMusicLabel(albumId) {
+    return new Promise(function (resolve) {
+      albumMusicQueue.push({ albumId: albumId, resolve: resolve });
+      pumpAlbumMusicQueue();
+    });
+  }
+
+  function ensureAlbumMusicLabel($card, row) {
+    var albumId = row && row.raw ? String(row.raw.Id || row.id || '') : '';
+    if (!albumId) return '';
+    if (row.music) return row.music;
+    if (albumMusicLabelCache[albumId]) {
+      row.music = albumMusicLabelCache[albumId];
+      return albumMusicLabelCache[albumId];
+    }
+    var list = albumMusicLabelCards[albumId];
+    if (!list) {
+      list = [];
+      albumMusicLabelCards[albumId] = list;
+      requestAlbumMusicLabel(albumId).then(function (label) {
+        delete albumMusicLabelCards[albumId];
+        list.forEach(function (c) {
+          if (!label) return;
+          if (c.row) c.row.music = label;
+          setCardMusicBadge(c.card, label);
+        });
+      });
+    }
+    list.push({ card: $card, row: row });
+    return '';
+  }
+
   function playAlbumTracks(row) {
     var albumId = (row.raw && row.raw.AlbumId) || '';
     fetchAlbumAudioRows(albumId).then(function (rows) {
@@ -6725,6 +6926,7 @@
 
   function openPhotoViewer(row, photos, index) {
     var list = Array.isArray(photos) && photos.length ? photos : [row];
+    photoReturnTarget = compactActivity(Lampa.Activity.active());
     savePhotoViewerResumeTarget(row);
     Lampa.Activity.push({
       url: jellyfinNavUrl(['jellyfin', 'photo']),
@@ -7517,6 +7719,20 @@
         return;
       }
       Lampa.Activity.backward();
+      setTimeout(function () {
+        var act = Lampa.Activity.active();
+        if (act && String(act.component || '') === PHOTO_VIEWER_COMPONENT) {
+          var target = photoReturnTarget || readViewerResumeTarget();
+          if (target && target.component) {
+            try {
+              Lampa.Storage.remove(VIEWER_RESUME_KEY);
+            } catch (err) {}
+            stopSlideshow();
+            Lampa.Activity.replace(target, true);
+          }
+        }
+        photoReturnTarget = null;
+      }, 0);
     };
   }
 
@@ -8597,7 +8813,13 @@
       setTimeout(function () {
         var act = Lampa.Activity.active();
         if (act && String(act.component || '') === AUDIO_PLAYER_COMPONENT) {
-          if (audioReturnTarget) Lampa.Activity.replace(audioReturnTarget, true);
+          var target = audioReturnTarget || readViewerResumeTarget();
+          if (target && target.component) {
+            try {
+              Lampa.Storage.remove(VIEWER_RESUME_KEY);
+            } catch (err) {}
+            Lampa.Activity.replace(target, true);
+          }
         }
         audioReturnTarget = null;
       }, 0);
@@ -9004,6 +9226,14 @@
     if (row.quality) {
       $chrome.append('<div class="jellyfin-badge jellyfin-badge-quality">' + row.quality + '</div>');
     }
+    if (row.music) {
+      $chrome.append('<div class="jellyfin-badge jellyfin-badge-music">' + row.music + '</div>');
+    } else if (row.type === 'MusicAlbum') {
+      var musicLabel = ensureAlbumMusicLabel($card, row);
+      if (musicLabel) {
+        $chrome.append('<div class="jellyfin-badge jellyfin-badge-music">' + musicLabel + '</div>');
+      }
+    }
     if (row.watched || row.playedPct >= 100) {
       var watchedClass = 'jellyfin-badge jellyfin-badge-watched';
       if ($chrome.find('.jellyfin-badge-episode').length) watchedClass += ' jellyfin-badge-watched--episode';
@@ -9299,7 +9529,7 @@
   function openHub() {
     Lampa.Activity.push({
       url: jellyfinNavUrl(['jellyfin', 'home']),
-      title: Lampa.Lang.translate('jellyfin_title'),
+      title: Lampa.Lang.translate('jellyfin_home'),
       component: HUB_COMPONENT,
       page: 1,
     });
@@ -9659,6 +9889,7 @@
       '.jellyfin-badge{position:absolute;padding:.28em .55em;font-size:.62em;border-radius:.7em;font-weight:800;line-height:1.1;backdrop-filter:blur(8px);box-shadow:0 3px 8px rgba(0,0,0,.25)}' +
       '.jellyfin-badge-episode{right:.4em;top:.4em;background:rgba(0,0,0,.72);color:#fff}' +
       '.jellyfin-badge-quality{left:.4em;top:.4em;background:rgba(0,122,255,.92);color:#fff}' +
+      '.jellyfin-badge-music{left:.4em;top:.4em;background:rgba(175,82,222,.92);color:#fff;max-width:calc(100% - .8em);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
       '.jellyfin-badge-watched{right:.4em;top:.4em;background:rgba(52,199,89,.92);color:#fff}' +
       '.jellyfin-badge-watched--episode{top:2.1em}' +
       '.jellyfin-card-progress{position:absolute;left:0;right:0;bottom:0;height:.28em;background:rgba(255,255,255,.18);z-index:5}' +
