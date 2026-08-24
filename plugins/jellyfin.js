@@ -27,6 +27,11 @@
   var TMDB_ENRICH_CONCURRENCY = 8;
   var PAGE_SIZE = 48;
   var IMG_PLACEHOLDER = './img/img_load.svg';
+  var RT_UI_TICK_MS = 1500;
+  var RT_TIMELINE_MS = 10000;
+  var RT_NET_INTERVAL_MS = 10000;
+  var EXTERNAL_TICKER_MS = 30000;
+  var SESSIONS_API_ENABLED = true;
   var API_CACHE_TTL_MS = 30 * 60 * 1000;
   var API_USERDATA_TTL_MS = 3 * 60 * 1000;
   var API_LATEST_TTL_MS = 5 * 60 * 1000;
@@ -80,7 +85,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 6',
+    version: '2.0.0 Beta 7',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -137,6 +142,30 @@
   var externalPlay = null;
   var externalPlayTicker = null;
   var syncingTimelineHash = '';
+  var jfStartedSessions = {};
+  var rtLastUiAt = 0;
+  var rtLastTimelineAt = 0;
+  var rtLastNetAt = 0;
+  var rtNetTimer = null;
+  var rtIsPaused = false;
+  var rtPlayerVideoHooked = false;
+  var externalPausedTotalMs = 0;
+  var externalPausedAt = 0;
+
+  function rtCancelPendingNet() {
+    if (rtNetTimer) {
+      clearTimeout(rtNetTimer);
+      rtNetTimer = null;
+    }
+  }
+
+  function secondsToTicks(sec) {
+    return Math.round(Math.max(0, Number(sec) || 0) * 10000000);
+  }
+
+  function runtimeSecondsOf(row) {
+    return Math.round((Number(row && row.raw && row.raw.RunTimeTicks) || 0) / 10000000);
+  }
 
   function addLang() {
     Lampa.Lang.add({
@@ -893,11 +922,13 @@
 
   function handlePlayerDestroy() {
     stopExternalPlaybackTicker();
-    flushPlaybackProgress();
+    terminateJfPlayback();
     flushPlaylistProgress();
     invalidateUserDataCaches();
     scheduleHubRefresh();
     externalPlay = null;
+    resetExternalPauseTracking();
+    rtIsPaused = false;
     currentAudioStreamIndex = null;
     currentPlayItemId = null;
     currentTimelineHash = null;
@@ -5756,6 +5787,10 @@
               Math.round((Number(ready.raw.RunTimeTicks) || 0) / 10000000)
             );
           }
+          if (ready && ready.raw && ready.raw.Id) {
+            resetExternalPauseTracking();
+            startJfPlaybackSession(ready.raw.Id, streamOpts.mediaSourceId);
+          }
           Lampa.Player.play(playItem);
         });
       })
@@ -5803,7 +5838,275 @@
     } catch (e) { }
   }
 
-  function reportPlaybackProgress(row, percent, timeSec, durationSec) {
+  function startJfPlaybackSession(itemId, mediaSourceId) {
+    var id = String(itemId || '');
+    if (!id || jfStartedSessions[id]) return;
+    var type = '';
+    if (currentPlayRow && currentPlayRow.raw && String(currentPlayRow.raw.Id) === id) {
+      type = String(currentPlayRow.type || currentPlayRow.raw.Type || '');
+    }
+    if (type !== 'Movie' && type !== 'Episode') return;
+    rtIsPaused = false;
+    var psid = playSessionId();
+    resolveUserId()
+      .then(function (userId) {
+        var body = {
+          ItemId: id,
+          PlaySessionId: psid,
+          MediaSourceId: mediaSourceId || undefined,
+          CanSeek: true,
+        };
+        if (currentAudioStreamIndex !== null && currentAudioStreamIndex !== undefined && currentAudioStreamIndex !== -1) {
+          body.AudioStreamIndex = currentAudioStreamIndex;
+        }
+        return jfHttp(
+          '/Sessions/Playing?userId=' + encodeURIComponent(userId),
+          { method: 'POST', jsonBody: body, dataType: 'text', cache: false }
+        );
+      })
+      .then(function () {
+        jfStartedSessions[id] = psid;
+      })
+      .catch(function () {
+        delete jfStartedSessions[id];
+      });
+  }
+
+  function postUserDataProgress(row, rowId, pct, t, played) {
+    return resolveUserId().then(function (userId) {
+      return jfHttp(
+        '/Users/' +
+        encodeURIComponent(userId) +
+        '/Items/' +
+        encodeURIComponent(rowId) +
+        '/UserData',
+        {
+          method: 'POST',
+          jsonBody: {
+            Played: played,
+            PlayedPercentage: Math.round(pct * 10) / 10,
+            PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
+            LastPlayedDate: new Date().toISOString(),
+          },
+          dataType: 'json',
+          cache: false,
+        }
+      );
+    });
+  }
+
+  function sendJfPlaybackProgress(row, rowId, pct, t, dur, played, force) {
+    var now = Date.now();
+    if (!force && now - rtLastNetAt < RT_NET_INTERVAL_MS) {
+      if (!rtNetTimer) {
+        rtNetTimer = setTimeout(function () {
+          rtNetTimer = null;
+          sendJfPlaybackProgress(row, rowId, pct, t, dur, played, true);
+        }, Math.max(0, RT_NET_INTERVAL_MS - (now - rtLastNetAt)));
+      }
+      return;
+    }
+    if (!force) rtCancelPendingNet();
+    rtLastNetAt = now;
+
+    var sid = jfStartedSessions[String(rowId)];
+    if (SESSIONS_API_ENABLED && sid) {
+      if (!cachedUserId) {
+        resolveUserId()
+          .then(function () {
+            sendJfPlaybackProgress(row, rowId, pct, t, dur, played, true);
+          })
+          .catch(function () { });
+        return;
+      }
+      jfHttp(
+        '/Sessions/Playing/Progress?userId=' + encodeURIComponent(cachedUserId || ''),
+        {
+          method: 'POST',
+          jsonBody: {
+            ItemId: String(rowId),
+            PlaySessionId: sid,
+            PositionTicks: secondsToTicks(played ? 0 : t),
+            IsPaused: !!rtIsPaused,
+            EventName: force ? 'UserDataSaved' : 'TimeUpdate',
+          },
+          dataType: 'text',
+          cache: false,
+        }
+      )
+        .then(function () {
+          if (played) invalidateUserDataCaches();
+        })
+        .catch(function () {
+          delete jfStartedSessions[String(rowId)];
+          postUserDataProgress(row, rowId, pct, t, played)
+            .catch(function () { });
+        });
+      return;
+    }
+
+    postUserDataProgress(row, rowId, pct, t, played)
+      .then(function () {
+        if (played) invalidateUserDataCaches();
+      })
+      .catch(function () { });
+  }
+
+  function syncPostJf(path, body) {
+    var base = apiBase();
+    var key = apiKey();
+    if (!base || !key) return false;
+    var url =
+      base +
+      path +
+      (path.indexOf('?') >= 0 ? '&' : '?') +
+      'api_key=' +
+      encodeURIComponent(key);
+    var payload = JSON.stringify(body);
+    try {
+      if (window.XMLHttpRequest) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', url, false);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.send(payload);
+        return true;
+      }
+    } catch (e) { }
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
+        return true;
+      }
+    } catch (e) { }
+    return false;
+  }
+
+  function terminateJfPlayback() {
+    rtCancelPendingNet();
+    var row = currentPlayRow;
+    var rowId = (row && row.raw && String(row.raw.Id)) || (lastPlaybackState && lastPlaybackState.id) || '';
+    if (!rowId) return;
+    var sid = jfStartedSessions[String(rowId)];
+    var state = readPlaybackState(row, rowId) || externalPlaybackEstimate();
+    var t = state ? Number(state.time) || 0 : 0;
+    var dur = state ? Number(state.duration) || 0 : 0;
+    var pct = state ? Number(state.pct) || 0 : 0;
+    if (!pct && dur > 0 && t > 0) pct = Math.min(100, Math.round((t / dur) * 100));
+    if (dur > 0 && t > 0 && t >= dur - 15) pct = 100;
+    if (lastCompletedRowId && String(rowId) === String(lastCompletedRowId)) pct = 100;
+    if (pct > 100) pct = 100;
+    if (pct < 0) pct = 0;
+    var played = pct >= 90;
+    if (sid) {
+      delete jfStartedSessions[String(rowId)];
+      if (cachedUserId) {
+        syncPostJf(
+          '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
+          {
+            ItemId: String(rowId),
+            PlaySessionId: sid,
+            PositionTicks: secondsToTicks(played ? 0 : t),
+          }
+        );
+        return;
+      }
+    }
+    if (pct < 5 && t < 10) return;
+    var userId = String(storedUserId() || cachedUserId || '').trim();
+    if (!userId) return;
+    syncPostJf(
+      '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(rowId) + '/UserData',
+      {
+        Played: played,
+        PlayedPercentage: Math.round(pct * 10) / 10,
+        PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
+        LastPlayedDate: new Date().toISOString(),
+      }
+    );
+  }
+
+  function isPluginVideoEl(target) {
+    if (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO') return false;
+    if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return false;
+    if (externalPlay && externalPlay.rowId) return false;
+    return true;
+  }
+
+  function handleRealtimeTime(cur, dur) {
+    if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return;
+    if (externalPlay && externalPlay.rowId) return;
+    cur = Number(cur) || 0;
+    dur = Number(dur) || 0;
+    if (dur <= 0 || cur <= 0) return;
+    var pct = Math.min(100, Math.max(0, Math.round((cur / dur) * 100)));
+    reportPlaybackProgress(currentPlayRow, pct, cur, dur, { realtime: true });
+  }
+
+  function installRealtimeProgress() {
+    try {
+      if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener && !rtPlayerVideoHooked) {
+        Lampa.PlayerVideo.listener.follow('timeupdate', function (e) {
+          handleRealtimeTime(e && e.current, e && e.duration);
+        });
+        rtPlayerVideoHooked = true;
+      }
+    } catch (e) { }
+    if (!document.addEventListener || rtPlayerVideoHooked) return;
+    document.addEventListener(
+      'timeupdate',
+      function (ev) {
+        var v = ev && ev.target;
+        if (!isPluginVideoEl(v)) return;
+        handleRealtimeTime(v.currentTime, v.duration);
+      },
+      true
+    );
+  }
+
+  function handleMediaPause(ev) {
+    if (!isPluginVideoEl(ev && ev.target)) return;
+    rtIsPaused = true;
+    var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
+    if (state) {
+      reportPlaybackProgress(
+        currentPlayRow,
+        state.pct,
+        state.time,
+        state.duration,
+        { force: true }
+      );
+    }
+    if (externalPlay && externalPlay.rowId && !externalPausedAt) {
+      externalPausedAt = Date.now();
+    }
+  }
+
+  function handleMediaPlay(ev) {
+    if (!isPluginVideoEl(ev && ev.target)) return;
+    rtIsPaused = false;
+    if (externalPlay && externalPlay.rowId && externalPausedAt) {
+      externalPausedTotalMs += Date.now() - externalPausedAt;
+      externalPausedAt = 0;
+    }
+    var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
+    if (state) {
+      reportPlaybackProgress(
+        currentPlayRow,
+        state.pct,
+        state.time,
+        state.duration,
+        { force: true }
+      );
+    }
+  }
+
+  function resetExternalPauseTracking() {
+    externalPausedTotalMs = 0;
+    externalPausedAt = 0;
+  }
+
+  function reportPlaybackProgress(row, percent, timeSec, durationSec, opts) {
+    opts = opts || {};
     if (!row || !row.raw || !row.raw.Id) return;
     var type = String(row.type || row.raw.Type || '');
     if (type !== 'Movie' && type !== 'Episode') return;
@@ -5824,8 +6127,25 @@
     }
     var ticks = Math.round(t * 10000000);
 
+    if (opts.realtime && !opts.force) {
+      var nowTs = Date.now();
+      if (nowTs - rtLastUiAt < RT_UI_TICK_MS) return;
+      rtLastUiAt = nowTs;
+    }
+    var wasWatched = !!row.watched;
+
     writeLocalProgress(row.raw.Id, pct, played ? 0 : t, played);
     applyLocalPlaybackState(row, played, pct, t);
+
+    try {
+      if (dur > 0 || t > 0) {
+        var nowTl = Date.now();
+        if (opts.force || nowTl - rtLastTimelineAt >= RT_TIMELINE_MS) {
+          rtLastTimelineAt = nowTl;
+          syncExternalTimeline(row, played ? 0 : t, dur > 0 ? dur : runtimeSecondsOf(row));
+        }
+      }
+    } catch (e) { }
 
     try {
       var live = playlistLiveRows[row.raw.Id];
@@ -5840,29 +6160,11 @@
       }
     } catch (e) { }
 
+    if (wasWatched !== played) invalidateUserDataCaches();
+
     if (pct < 5 && t < 10) return;
 
-    resolveUserId()
-      .then(function (userId) {
-        var body = {
-          Played: played,
-          PlayedPercentage: Math.round(pct * 10) / 10,
-          PlaybackPositionTicks: played ? 0 : ticks,
-          LastPlayedDate: new Date().toISOString(),
-        };
-        return jfHttp(
-          '/Users/' +
-          encodeURIComponent(userId) +
-          '/Items/' +
-          encodeURIComponent(row.raw.Id) +
-          '/UserData',
-          { method: 'POST', jsonBody: body, dataType: 'json', cache: false }
-        );
-      })
-      .then(function () {
-        invalidateUserDataCaches();
-      })
-      .catch(function () { });
+    sendJfPlaybackProgress(row, row.raw.Id, pct, t, dur, played, !opts.realtime || opts.force);
   }
 
   function readPlaydata() {
@@ -5916,7 +6218,9 @@
 
   function externalElapsedSeconds() {
     if (!externalPlay) return 0;
-    return Math.max(0, Math.floor((Date.now() - externalPlay.startAt) / 1000));
+    var ms = Date.now() - externalPlay.startAt - externalPausedTotalMs;
+    if (externalPausedAt) ms -= Date.now() - externalPausedAt;
+    return Math.max(0, Math.floor(ms / 1000));
   }
 
   function externalPlaybackEstimate() {
@@ -5944,7 +6248,7 @@
 
   function startExternalPlaybackTicker() {
     stopExternalPlaybackTicker();
-    externalPlayTicker = setInterval(tickExternalPlaybackProgress, 30000);
+    externalPlayTicker = setInterval(tickExternalPlaybackProgress, EXTERNAL_TICKER_MS);
   }
 
   function stopExternalPlaybackTicker() {
@@ -5953,15 +6257,6 @@
       clearInterval(externalPlayTicker);
     } catch (e) { }
     externalPlayTicker = null;
-  }
-
-  function flushPlaybackProgress() {
-    var row = currentPlayRow;
-    if (!row) return;
-    var state = readPlaybackState(row, row && row.raw && row.raw.Id);
-    if (!state) state = externalPlaybackEstimate();
-    if (!state) return;
-    reportPlaybackProgress(row, state.pct, state.time, state.duration);
   }
 
   function flushPlaylistProgress() {
@@ -5994,7 +6289,7 @@
     } catch (e) { }
   }
 
-  function syncFlushPlaybackProgress() {
+  function syncFlushPlaybackProgress(keepSession) {
     var row = currentPlayRow || null;
     var rowId = row && row.raw && row.raw.Id;
     var rowType = row ? String(row.type || row.raw.Type || '') : '';
@@ -6004,6 +6299,21 @@
     }
     if (!rowId) return;
     if (rowType && rowType !== 'Movie' && rowType !== 'Episode') return;
+    if (!keepSession && jfStartedSessions[String(rowId)] && cachedUserId) {
+      var st = readPlaybackState(row, rowId) || externalPlaybackEstimate();
+      var stopT = st ? Number(st.time) || 0 : 0;
+      syncPostJf(
+        '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
+        {
+          ItemId: String(rowId),
+          PlaySessionId: jfStartedSessions[String(rowId)],
+          PositionTicks: secondsToTicks(stopT),
+        }
+      );
+      delete jfStartedSessions[String(rowId)];
+      rtCancelPendingNet();
+      return;
+    }
     var state = readPlaybackState(row, rowId);
     if (!state && externalPlay && String(externalPlay.rowId) === String(rowId)) {
       state = externalPlaybackEstimate();
@@ -11208,11 +11518,17 @@
     if (document.addEventListener) {
       document.addEventListener('seeked', handleVideoSeeked, true);
       document.addEventListener('ended', handleVideoEnded, true);
+      document.addEventListener('pause', handleMediaPause, true);
+      document.addEventListener('play', handleMediaPlay, true);
     }
+
+    installRealtimeProgress();
 
     try {
       var onAppHidden = function () {
-        syncFlushPlaybackProgress();
+        terminateJfPlayback();
+        rtIsPaused = false;
+        resetExternalPauseTracking();
       };
       window.addEventListener('pagehide', onAppHidden);
       window.addEventListener('beforeunload', onAppHidden);
@@ -11220,16 +11536,16 @@
       if (document.addEventListener) {
         document.addEventListener('visibilitychange', function () {
           if (document.visibilityState === 'hidden') {
-            syncFlushPlaybackProgress();
+            syncFlushPlaybackProgress(true);
           } else if (document.visibilityState === 'visible') {
-            if (externalPlay && externalPlay.rowId) syncFlushPlaybackProgress();
+            if (externalPlay && externalPlay.rowId) syncFlushPlaybackProgress(true);
           }
         });
         document.addEventListener('webkitvisibilitychange', function () {
           if (document.webkitVisibilityState === 'hidden') {
-            syncFlushPlaybackProgress();
+            syncFlushPlaybackProgress(true);
           } else if (document.webkitVisibilityState === 'visible') {
-            if (externalPlay && externalPlay.rowId) syncFlushPlaybackProgress();
+            if (externalPlay && externalPlay.rowId) syncFlushPlaybackProgress(true);
           }
         });
         document.addEventListener('freeze', onAppHidden);
