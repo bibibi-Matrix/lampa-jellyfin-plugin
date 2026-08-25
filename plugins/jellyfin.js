@@ -27,10 +27,10 @@
   var TMDB_ENRICH_CONCURRENCY = 8;
   var PAGE_SIZE = 48;
   var IMG_PLACEHOLDER = './img/img_load.svg';
-  var RT_UI_TICK_MS = 1500;
+  var RT_UI_TICK_MS = 250;
   var RT_TIMELINE_MS = 10000;
   var RT_NET_INTERVAL_MS = 10000;
-  var EXTERNAL_TICKER_MS = 30000;
+  var EXTERNAL_TICKER_MS = 1000;
   var SESSIONS_API_ENABLED = true;
   var API_CACHE_TTL_MS = 30 * 60 * 1000;
   var API_USERDATA_TTL_MS = 3 * 60 * 1000;
@@ -85,7 +85,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 9',
+    version: '2.0.0 Beta 10',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
