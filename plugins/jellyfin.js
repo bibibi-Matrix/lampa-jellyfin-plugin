@@ -85,7 +85,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 8',
+    version: '2.0.0 Beta 9',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -151,6 +151,8 @@
   var rtPlayerVideoHooked = false;
   var externalPausedTotalMs = 0;
   var externalPausedAt = 0;
+  var externalPlayFinalSyncDone = false;
+  var externalPlayFinalTicks = 0;
 
   function rtCancelPendingNet() {
     if (rtNetTimer) {
@@ -5985,6 +5987,29 @@
   }
 
   function terminateJfPlayback() {
+    if (externalPlayFinalSyncDone) {
+      externalPlayFinalSyncDone = false;
+      rtCancelPendingNet();
+      try {
+        var row = currentPlayRow;
+        var rowId = (row && row.raw && String(row.raw.Id)) || (lastPlaybackState && lastPlaybackState.id) || '';
+        if (rowId) {
+          var sid = jfStartedSessions[String(rowId)];
+          if (sid && cachedUserId) {
+            delete jfStartedSessions[String(rowId)];
+            syncPostJf(
+              '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
+              {
+                ItemId: String(rowId),
+                PlaySessionId: sid,
+                PositionTicks: externalPlayFinalTicks,
+              }
+            );
+          }
+        }
+      } catch (e) { }
+      return;
+    }
     rtCancelPendingNet();
     try {
       var row = currentPlayRow;
@@ -11595,9 +11620,12 @@
             syncFlushPlaybackProgress(true);
           } else if (document.visibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
-              stopExternalPlaybackTicker();
-              externalPlay = null;
+              var finalEst = externalPlaybackEstimate();
+              externalPlayFinalTicks = finalEst ? secondsToTicks(finalEst.time || 0) : 0;
               syncFlushPlaybackProgress(true);
+              stopExternalPlaybackTicker();
+              externalPlayFinalSyncDone = true;
+              externalPlay = null;
             }
           }
         });
@@ -11606,9 +11634,12 @@
             syncFlushPlaybackProgress(true);
           } else if (document.webkitVisibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
-              stopExternalPlaybackTicker();
-              externalPlay = null;
+              var finalEst = externalPlaybackEstimate();
+              externalPlayFinalTicks = finalEst ? secondsToTicks(finalEst.time || 0) : 0;
               syncFlushPlaybackProgress(true);
+              stopExternalPlaybackTicker();
+              externalPlayFinalSyncDone = true;
+              externalPlay = null;
             }
           }
         });
