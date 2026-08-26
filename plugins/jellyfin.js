@@ -84,7 +84,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 11',
+    version: '2.0.0 Beta 12',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -2802,12 +2802,13 @@
     var best = {};
     rows.forEach(function (row) {
       var raw = row.raw || {};
+      var idx = Number(raw.IndexNumber) || 0;
       var key =
         String(raw.SeriesId || '') +
         '/' +
         String(raw.ParentIndexNumber || 0) +
         '/' +
-        String(raw.IndexNumber || 0);
+        (idx > 0 ? String(idx) : 'id:' + String(row.id || raw.Id || ''));
       best[key] = mergeTmdbRows(best[key], row);
     });
     return sortEpisodeRows(
@@ -6761,15 +6762,15 @@
           encodeURIComponent(albumId) +
           '&Recursive=false&IncludeItemTypes=Audio&Fields=' +
           encodeURIComponent('MediaSources,RunTimeTicks,ProviderIds,AlbumId,Album,ArtistItems') +
-          '&SortBy=ParentIndexNumber&SortBy=IndexNumber&SortOrder=Ascending'
-        ).then(function (data) {
-          var items = ((data && data.Items) || []).filter(function (it) {
-            return it && it.Type === 'Audio';
-          });
-          return items.map(function (it) {
-            return mapRow(it);
-          });
+        '&SortBy=ParentIndexNumber&SortBy=IndexNumber&SortOrder=Ascending'
+      ).then(function (data) {
+        var items = ((data && data.Items) || []).filter(function (it) {
+          return it && it.Type === 'Audio';
         });
+        return items.map(function (it) {
+          return mapRow(it);
+        });
+      });
       })
       .catch(function () {
         return [];
