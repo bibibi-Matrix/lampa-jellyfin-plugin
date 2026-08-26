@@ -29,9 +29,8 @@
   var IMG_PLACEHOLDER = './img/img_load.svg';
   var RT_UI_TICK_MS = 250;
   var RT_TIMELINE_MS = 10000;
-  var RT_NET_INTERVAL_MS = 10000;
+  var RT_NET_INTERVAL_MS = 2000;
   var EXTERNAL_TICKER_MS = 250;
-  var SESSIONS_API_ENABLED = true;
   var API_CACHE_TTL_MS = 30 * 60 * 1000;
   var API_USERDATA_TTL_MS = 3 * 60 * 1000;
   var API_LATEST_TTL_MS = 5 * 60 * 1000;
@@ -85,7 +84,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 10',
+    version: '2.0.0 Beta 11',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -142,7 +141,6 @@
   var externalPlay = null;
   var externalPlayTicker = null;
   var syncingTimelineHash = '';
-  var jfStartedSessions = {};
   var rtLastUiAt = 0;
   var rtLastTimelineAt = 0;
   var rtLastNetAt = 0;
@@ -5793,8 +5791,8 @@
             );
           }
           if (ready && ready.raw && ready.raw.Id) {
+            rtIsPaused = false;
             resetExternalPauseTracking();
-            startJfPlaybackSession(ready.raw.Id, streamOpts.mediaSourceId);
           }
           Lampa.Player.play(playItem);
         });
@@ -5843,207 +5841,136 @@
     } catch (e) { }
   }
 
-  function startJfPlaybackSession(itemId, mediaSourceId) {
-    var id = String(itemId || '');
-    if (!id || jfStartedSessions[id]) return;
-    var type = '';
-    if (currentPlayRow && currentPlayRow.raw && String(currentPlayRow.raw.Id) === id) {
-      type = String(currentPlayRow.type || currentPlayRow.raw.Type || '');
-    }
-    if (type !== 'Movie' && type !== 'Episode') return;
-    rtIsPaused = false;
-    var psid = playSessionId();
-    resolveUserId()
-      .then(function (userId) {
-        var body = {
-          ItemId: id,
-          PlaySessionId: psid,
-          MediaSourceId: mediaSourceId || undefined,
-          CanSeek: true,
-        };
-        if (currentAudioStreamIndex !== null && currentAudioStreamIndex !== undefined && currentAudioStreamIndex !== -1) {
-          body.AudioStreamIndex = currentAudioStreamIndex;
-        }
-        return jfHttp(
-          '/Sessions/Playing?userId=' + encodeURIComponent(userId),
-          { method: 'POST', jsonBody: body, dataType: 'text', cache: false }
-        );
-      })
-      .then(function () {
-        jfStartedSessions[id] = psid;
-      })
-      .catch(function () {
-        delete jfStartedSessions[id];
-      });
-  }
-
-  function postUserDataProgress(row, rowId, pct, t, played) {
-    return resolveUserId().then(function (userId) {
-      return jfHttp(
-        '/Users/' +
-        encodeURIComponent(userId) +
-        '/Items/' +
-        encodeURIComponent(rowId) +
-        '/UserData',
-        {
-          method: 'POST',
-          jsonBody: {
-            Played: played,
-            PlayedPercentage: Math.round(pct * 10) / 10,
-            PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
-            LastPlayedDate: new Date().toISOString(),
-          },
-          dataType: 'json',
-          cache: false,
-        }
-      );
-    });
-  }
-
   function sendJfPlaybackProgress(row, rowId, pct, t, dur, played, force) {
-    var now = Date.now();
-    if (!force && now - rtLastNetAt < RT_NET_INTERVAL_MS) {
-      if (!rtNetTimer) {
-        rtNetTimer = setTimeout(function () {
-          rtNetTimer = null;
-          sendJfPlaybackProgress(row, rowId, pct, t, dur, played, true);
-        }, Math.max(0, RT_NET_INTERVAL_MS - (now - rtLastNetAt)));
-      }
-      return;
-    }
-    if (!force) rtCancelPendingNet();
-    rtLastNetAt = now;
-
-    var sid = jfStartedSessions[String(rowId)];
-    if (SESSIONS_API_ENABLED && sid) {
-      if (!cachedUserId) {
-        resolveUserId()
-          .then(function () {
-            sendJfPlaybackProgress(row, rowId, pct, t, dur, played, true);
-          })
-          .catch(function () { });
-        return;
-      }
-      jfHttp(
-        '/Sessions/Playing/Progress?userId=' + encodeURIComponent(cachedUserId || ''),
-        {
-          method: 'POST',
-          jsonBody: {
-            ItemId: String(rowId),
-            PlaySessionId: sid,
-            PositionTicks: secondsToTicks(played ? 0 : t),
-            IsPaused: !!rtIsPaused,
-            EventName: force ? 'UserDataSaved' : 'TimeUpdate',
-          },
-          dataType: 'text',
-          cache: false,
-        }
-      )
+    var id = String(rowId || '');
+    if (!id) return;
+    var userId = String(storedUserId() || cachedUserId || '').trim();
+    if (!userId) {
+      resolveUserId()
         .then(function () {
-          if (played) invalidateUserDataCaches();
+          sendJfPlaybackProgress(row, rowId, pct, t, dur, played, true);
         })
-        .catch(function () {
-          delete jfStartedSessions[String(rowId)];
-          postUserDataProgress(row, rowId, pct, t, played)
-            .catch(function () { });
-        });
+        .catch(function () { });
       return;
     }
-
-    postUserDataProgress(row, rowId, pct, t, played)
-      .then(function () {
-        if (played) invalidateUserDataCaches();
-      })
-      .catch(function () { });
+    syncPostJf(
+      '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(id) + '/UserData',
+      {
+        Played: played,
+        PlayedPercentage: Math.round(pct * 10) / 10,
+        PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
+        LastPlayedDate: new Date().toISOString(),
+      }
+    );
   }
 
-  function syncPostJf(path, body) {
+  var lastSaveWarnAt = 0;
+  function warnSaveOnce(text) {
+    var now = Date.now();
+    if (now - lastSaveWarnAt < 15000) return;
+    lastSaveWarnAt = now;
+    try {
+      Lampa.Bell.push({ text: 'Jellyfin sync: ' + text });
+    } catch (e) { }
+  }
+
+  function jfPostUrl(path) {
     var base = apiBase();
     var key = apiKey();
-    if (!base || !key) return false;
-    var url =
+    if (!base || !key) return '';
+    return (
       base +
       path +
       (path.indexOf('?') >= 0 ? '&' : '?') +
       'api_key=' +
-      encodeURIComponent(key);
-    var payload = JSON.stringify(body);
+      encodeURIComponent(key)
+    );
+  }
+
+  function postJfSync(url, payload, path) {
     try {
-      if (window.XMLHttpRequest) {
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', url, false);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.send(payload);
-        return true;
+      if (!window.XMLHttpRequest) return false;
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', url, false);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.send(payload);
+      if (xhr.status === 0) {
+        warnSaveOnce('запрос заблокирован браузером');
+        return false;
       }
-    } catch (e) { }
+      if (xhr.status >= 300) {
+        warnSaveOnce('HTTP ' + xhr.status + ' → ' + String(path).split('?')[0]);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function postJfBeacon(url, payload) {
     try {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
+      if (navigator.sendBeacon && navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }))) {
         return true;
       }
     } catch (e) { }
     return false;
   }
 
-  function terminateJfPlayback() {
-    if (externalPlayFinalSyncDone) {
-      externalPlayFinalSyncDone = false;
-      rtCancelPendingNet();
-      try {
-        var row = currentPlayRow;
-        var rowId = (row && row.raw && String(row.raw.Id)) || (lastPlaybackState && lastPlaybackState.id) || '';
-        if (rowId) {
-          var sid = jfStartedSessions[String(rowId)];
-          if (sid && cachedUserId) {
-            delete jfStartedSessions[String(rowId)];
-            syncPostJf(
-              '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
-              {
-                ItemId: String(rowId),
-                PlaySessionId: sid,
-                PositionTicks: externalPlayFinalTicks,
-              }
-            );
-          }
-        }
-      } catch (e) { }
-      return;
+  function syncPostJf(path, body) {
+    var url = jfPostUrl(path);
+    if (!url) {
+      warnSaveOnce('нет адреса сервера или API-ключа');
+      return false;
     }
+    var payload = JSON.stringify(body);
+    if (postJfSync(url, payload, path)) return true;
+    return postJfBeacon(url, payload);
+  }
+
+  function syncPostJfUnload(path, body) {
+    return syncPostJf(path, body);
+  }
+
+  function terminateJfPlayback() {
     rtCancelPendingNet();
     try {
       var row = currentPlayRow;
       var rowId = (row && row.raw && String(row.raw.Id)) || (lastPlaybackState && lastPlaybackState.id) || '';
       if (!rowId) return;
-      var sid = jfStartedSessions[String(rowId)];
-      var state = readPlaybackState(row, rowId) || externalPlaybackEstimate();
-      var t = state ? Number(state.time) || 0 : 0;
-      var dur = state ? Number(state.duration) || 0 : 0;
-      var pct = state ? Number(state.pct) || 0 : 0;
+      var type = '';
+      if (row && row.raw) type = String(row.type || row.raw.Type || '');
+      else if (lastPlaybackState) type = String(lastPlaybackState.type || '');
+      if (type && type !== 'Movie' && type !== 'Episode') return;
+      var state = readPlaybackState(row, rowId);
+      if (!state && externalPlay && String(externalPlay.rowId) === String(rowId)) {
+        state = externalPlaybackEstimate();
+      }
+      var t = 0;
+      var dur = 0;
+      var pct = 0;
+      if (state) {
+        t = Number(state.time) || 0;
+        dur = Number(state.duration) || 0;
+        pct = Number(state.pct) || 0;
+      } else if (externalPlayFinalSyncDone) {
+        externalPlayFinalSyncDone = false;
+        t = Math.max(0, Math.round((Number(externalPlayFinalTicks) || 0) / 10000000));
+      } else {
+        return;
+      }
       if (!pct && dur > 0 && t > 0) pct = Math.min(100, Math.round((t / dur) * 100));
       if (dur > 0 && t > 0 && t >= dur - 15) pct = 100;
       if (lastCompletedRowId && String(rowId) === String(lastCompletedRowId)) pct = 100;
       if (pct > 100) pct = 100;
       if (pct < 0) pct = 0;
       var played = pct >= 90;
-      if (sid) {
-        delete jfStartedSessions[String(rowId)];
-        if (cachedUserId) {
-          syncPostJf(
-            '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
-            {
-              ItemId: String(rowId),
-              PlaySessionId: sid,
-              PositionTicks: secondsToTicks(played ? 0 : t),
-            }
-          );
-          return;
-        }
-      }
-      if (pct < 5 && t < 10) return;
+      if (!played && pct < 5 && t < 10) return;
       var userId = String(storedUserId() || cachedUserId || '').trim();
       if (!userId) return;
-      syncPostJf(
+      writeLocalProgress(rowId, pct, played ? 0 : t, played);
+      if (row) applyLocalPlaybackState(row, played, pct, t);
+      syncPostJfUnload(
         '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(rowId) + '/UserData',
         {
           Played: played,
@@ -6194,7 +6121,14 @@
 
     if (pct < 5 && t < 10) return;
 
-    sendJfPlaybackProgress(row, row.raw.Id, pct, t, dur, played, !opts.realtime || opts.force);
+    var forceSend = !opts.realtime || opts.force;
+    if (!forceSend) {
+      var nowNet = Date.now();
+      if (nowNet - rtLastNetAt < RT_NET_INTERVAL_MS) return;
+      rtLastNetAt = nowNet;
+    }
+
+    sendJfPlaybackProgress(row, row.raw.Id, pct, t, dur, played, forceSend);
   }
 
   function readPlaydata() {
@@ -6329,21 +6263,6 @@
     }
     if (!rowId) return;
     if (rowType && rowType !== 'Movie' && rowType !== 'Episode') return;
-    if (!keepSession && jfStartedSessions[String(rowId)] && cachedUserId) {
-      var st = readPlaybackState(row, rowId) || externalPlaybackEstimate();
-      var stopT = st ? Number(st.time) || 0 : 0;
-      syncPostJf(
-        '/Sessions/Playing/Stopped?userId=' + encodeURIComponent(cachedUserId),
-        {
-          ItemId: String(rowId),
-          PlaySessionId: jfStartedSessions[String(rowId)],
-          PositionTicks: secondsToTicks(stopT),
-        }
-      );
-      delete jfStartedSessions[String(rowId)];
-      rtCancelPendingNet();
-      return;
-    }
     var state = readPlaybackState(row, rowId);
     if (!state && externalPlay && String(externalPlay.rowId) === String(rowId)) {
       state = externalPlaybackEstimate();
@@ -6363,38 +6282,17 @@
     }
     writeLocalProgress(rowId, pct, played ? 0 : t, played);
     if (row) applyLocalPlaybackState(row, played, pct, t);
-    var base = apiBase();
-    var key = apiKey();
     var userId = String(storedUserId() || cachedUserId || '').trim();
-    if (!base || !key || !userId) return;
-    var url =
-      base +
-      '/Users/' +
-      encodeURIComponent(userId) +
-      '/Items/' +
-      encodeURIComponent(rowId) +
-      '/UserData?api_key=' +
-      encodeURIComponent(key);
-    var body = JSON.stringify({
-      Played: played,
-      PlayedPercentage: Math.round(pct * 10) / 10,
-      PlaybackPositionTicks: played ? 0 : Math.round(t * 10000000),
-      LastPlayedDate: new Date().toISOString(),
-    });
-    try {
-      if (window.XMLHttpRequest) {
-        var xhr = new XMLHttpRequest();
-        xhr.open('POST', url, false);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.send(body);
-        return;
+    if (!userId) return;
+    syncPostJfUnload(
+      '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(rowId) + '/UserData',
+      {
+        Played: played,
+        PlayedPercentage: Math.round(pct * 10) / 10,
+        PlaybackPositionTicks: played ? 0 : Math.round(t * 10000000),
+        LastPlayedDate: new Date().toISOString(),
       }
-    } catch (e) { }
-    try {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
-      }
-    } catch (e) { }
+    );
   }
 
   function handleVideoSeeked(e) {
