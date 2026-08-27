@@ -252,6 +252,14 @@
         en: 'Tap card to play (long = menu)',
         ru: 'Нажатие — смотреть (долгое — меню)',
       },
+      jellyfin_set_sync_watched: {
+        en: 'Sync watched status with TMDB cards',
+        ru: 'Синхронизировать «просмотрено» с карточками TMDB',
+      },
+      jellyfin_set_sync_watched_hint: {
+        en: 'Watched/unwatched state syncs both ways between Jellyfin and TMDB cards in Lampa (matched by TMDB id)',
+        ru: 'Статус «просмотрено» синхронизируется в обе стороны между Jellyfin и карточками TMDB в Lampa (по TMDB id)',
+      },
       jellyfin_set_transcode: {
         en: 'HLS transcoding (Lampa player)',
         ru: 'HLS-транскодинг (плеер Lampa)',
@@ -491,7 +499,7 @@
     var key = tmdbCacheKey(tmdb);
     var entry = tmdbMetaCache[key];
     if (!entry) return null;
-    if (Date.now() - entry.loadedAt > TMDB_META_TTL_MS) {
+    if (Date.now() - entry.loadedAt > TMDB_META_TTL_MS || !(entry.data && entry.data.v === 2)) {
       delete tmdbMetaCache[key];
       return null;
     }
@@ -929,6 +937,11 @@
     externalPlay = null;
     resetExternalPauseTracking();
     rtIsPaused = false;
+    tmdbSync.sessionPaused = false;
+    try {
+      tmdbSyncStopSession();
+    } catch (e) { }
+    tmdbSyncClearJfMirror();
     currentAudioStreamIndex = null;
     currentPlayItemId = null;
     currentTimelineHash = null;
@@ -954,6 +967,7 @@
         try {
           Lampa.Listener.send('jellyfin:hub-refresh', {});
         } catch (e) { }
+        scheduleTmdbSyncFromLibrary();
       }, 1500);
     } catch (e) { }
   }
@@ -2700,12 +2714,15 @@
     return tmdbJson(url)
       .then(function (data) {
         var meta = {
+          v: 2,
           title:
             data.title ||
             data.name ||
             data.original_title ||
             data.original_name ||
             '',
+          originalTitle: data.original_title || '',
+          originalName: data.original_name || '',
           year: String(
             (data.release_date || data.first_air_date || '').slice(0, 4) || ''
           ),
@@ -4550,7 +4567,7 @@
         encodeURIComponent(seriesId) +
         '&IncludeItemTypes=Episode&Recursive=true&Fields=' +
         encodeURIComponent(
-          'ProviderIds,ImageTags,IndexNumber,ParentIndexNumber,UserData,SeriesName,SeriesPrimaryImageTag,SeriesThumbImageTag,Name,RunTimeTicks,MediaSourceCount,MediaSources,Overview'
+          'ProviderIds,ImageTags,IndexNumber,ParentIndexNumber,UserData,SeriesName,SeriesId,SeriesPrimaryImageTag,SeriesThumbImageTag,Name,RunTimeTicks,MediaSourceCount,MediaSources,Overview'
         ) +
         '&SortBy=ParentIndexNumber&SortBy=IndexNumber&SortOrder=Ascending'
       ).then(function (data) {
@@ -4567,27 +4584,38 @@
 
     libraryIndexInflight = resolveUserId()
       .then(function (userId) {
-        return jfHttp(
-          '/Items?UserId=' +
-          encodeURIComponent(userId) +
-          '&Recursive=true&IncludeItemTypes=Movie,Series&Fields=' +
-          encodeURIComponent(
-            'ProviderIds,Type,Id,Name,UserData,ImageTags,MediaSourceCount,MediaSources'
-          ) +
-          '&Limit=500'
-        );
-      })
-      .then(function (data) {
         var byTmdb = {};
-        ((data && data.Items) || []).forEach(function (item) {
-          var type = String(item.Type || '').toLowerCase();
-          if (type === 'movie' && !libraryCategoryEnabled('movies')) return;
-          if (type === 'series' && !libraryCategoryEnabled('tvshows')) return;
-          var tmdb = tmdbFromItem(item);
-          if (!tmdb) return;
-          var key = tmdb.method + '/' + tmdb.id;
-          byTmdb[key] = mergeTmdbRows(byTmdb[key], mapRow(item));
-        });
+        function fetchPage(start) {
+          return jfHttp(
+            '/Items?UserId=' +
+            encodeURIComponent(userId) +
+            '&Recursive=true&IncludeItemTypes=Movie,Series&StartIndex=' +
+            (start || 0) +
+            '&Limit=500&Fields=' +
+            encodeURIComponent(
+              'ProviderIds,Type,Id,Name,UserData,ImageTags,MediaSourceCount,MediaSources,RunTimeTicks'
+            )
+          ).then(function (data) {
+            ((data && data.Items) || []).forEach(function (item) {
+              var type = String(item.Type || '').toLowerCase();
+              if (type === 'movie' && !libraryCategoryEnabled('movies')) return;
+              if (type === 'series' && !libraryCategoryEnabled('tvshows')) return;
+              var tmdb = tmdbFromItem(item);
+              if (!tmdb) return;
+              var key = tmdb.method + '/' + tmdb.id;
+              byTmdb[key] = mergeTmdbRows(byTmdb[key], mapRow(item));
+            });
+            var items = (data && data.Items) || [];
+            var total = Number((data && data.TotalRecordCount) || 0) || (start || 0) + items.length;
+            if (items.length && (start || 0) + items.length < total) {
+              return fetchPage((start || 0) + items.length);
+            }
+            return byTmdb;
+          });
+        }
+        return fetchPage(0);
+      })
+      .then(function (byTmdb) {
         libraryIndex.byTmdb = byTmdb;
         libraryIndex.loadedAt = Date.now();
         return byTmdb;
@@ -6188,6 +6216,12 @@
 
     if (wasWatched !== played) invalidateUserDataCaches();
 
+    try {
+      tmdbSyncApplyRealtimeMirror(pct, t, dur);
+    } catch (e) { }
+
+    if (played) tmdbSyncApplyForRow(row, true);
+
     if (pct < 5 && t < 10) return;
 
     var forceSend = !opts.realtime || opts.force;
@@ -6452,6 +6486,7 @@
       lastProgressResetTimer = null;
     }, 5000);
     postItemUnplayed(id);
+    tmdbSyncApplyForRow(row, false);
     scheduleHubRefresh();
   }
 
@@ -6505,6 +6540,7 @@
         : jfHttp(path, { method: 'DELETE', dataType: 'text' });
       return req.then(function (result) {
         invalidateUserDataCaches();
+        tmdbSyncApplyForRow(row, watched);
         return result;
       });
     });
@@ -9902,6 +9938,10 @@
           } catch (err) {}
         }
 
+        try {
+          tmdbSyncRegisterCard(e.object);
+        } catch (err) { }
+
         if (!storageToggle('FullButton', true)) return;
 
         if (e.object.jellyfinRow) {
@@ -10718,6 +10758,16 @@
         field: { name: Lampa.Lang.translate('jellyfin_set_tap_play') },
         onChange: function () {
           Lampa.Settings.update();
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'SyncWatched' },
+        field: { name: Lampa.Lang.translate('jellyfin_set_sync_watched') },
+        onChange: function () {
+          Lampa.Settings.update();
+          scheduleTmdbSyncFromLibrary();
         },
       });
     }
@@ -11584,6 +11634,873 @@
     } catch (e) { }
   }
 
+  var tmdbSyncEnabled = function () {
+    return storageToggle('SyncWatched', true) && !!(apiBase() && apiKey());
+  };
+
+  var tmdbSync = {
+    guards: {},
+    pushed: {},
+    active: [],
+    seriesCache: {},
+    episodesCache: {},
+    episodesInflight: {},
+    bulkTimer: null,
+    pruneAt: 0,
+    session: null,
+    sessionBusy: false,
+    sessionQueued: false,
+    sessionTimer: null,
+    sessionToken: 0,
+    sessionPaused: false,
+    jfActiveHash: '',
+    jfLastWriteAt: 0,
+  };
+
+  function tmdbSyncPrune() {
+    var now = Date.now();
+    var keys = Object.keys(tmdbSync.guards);
+    if (keys.length > 60) {
+      keys.forEach(function (k) {
+        if (now - (tmdbSync.guards[k].at || 0) > 120000) delete tmdbSync.guards[k];
+      });
+    }
+    keys = Object.keys(tmdbSync.pushed);
+    if (keys.length > 200) {
+      keys.forEach(function (k) {
+        if (now - tmdbSync.pushed[k].at > 1800000) delete tmdbSync.pushed[k];
+      });
+    }
+    [tmdbSync.seriesCache, tmdbSync.episodesCache].forEach(function (c) {
+      Object.keys(c).forEach(function (k) {
+        if (now - c[k].at > 1200000) delete c[k];
+      });
+    });
+  }
+
+  function tmdbSyncRememberPush(hash, pct) {
+    tmdbSync.pushed[hash] = { pct: Math.round(Number(pct) || 0), at: Date.now() };
+  }
+
+  function tmdbSyncShouldPush(hash, pct) {
+    var rec = tmdbSync.pushed[hash];
+    if (!rec) return true;
+    if (Date.now() - rec.at > 300000) return true;
+    return rec.pct !== Math.round(Number(pct) || 0);
+  }
+
+  function tmdbSyncGuard(hash, pct) {
+    if (!hash) return;
+    if (Date.now() - tmdbSync.pruneAt > 120000) {
+      tmdbSync.pruneAt = Date.now();
+      tmdbSyncPrune();
+    }
+    tmdbSync.guards[hash] = { at: Date.now(), pct: Math.round(Number(pct) || 0) };
+  }
+
+  function tmdbSyncGuardHit(hash, pct) {
+    if (!hash || !tmdbSync.guards[hash]) return false;
+    var g = tmdbSync.guards[hash];
+    if (Date.now() - g.at >= 60000) {
+      delete tmdbSync.guards[hash];
+      return false;
+    }
+    return Math.round(Number(pct) || 0) === g.pct;
+  }
+
+  function tmdbMovieHash(originalTitle) {
+    return Lampa.Utils.hash(String(originalTitle || ''));
+  }
+
+  function tmdbEpisodeHash(originalName, season, episode) {
+    var s = Number(season) || 0;
+    var e = Number(episode) || 0;
+    return Lampa.Utils.hash([s, s > 10 ? ':' : '', e, String(originalName || '')].join(''));
+  }
+
+  function tmdbSyncWriteHash(hash, pct) {
+    if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
+    tmdbSyncGuard(hash, pct);
+    try {
+      Lampa.Timeline.update({
+        hash: hash,
+        percent: Number(pct) || 0,
+        time: 0,
+        duration: 0,
+        profile: 0,
+        updated: Date.now(),
+      });
+    } catch (e) { }
+  }
+
+  function tmdbSyncWriteTimeline(hash, pct, time, duration) {
+    if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
+    var t = Math.max(0, Number(time) || 0);
+    var dur = Math.max(0, Number(duration) || 0);
+    var p = Math.min(100, Math.max(0, Number(pct) || 0));
+    if (dur > 0 && t >= dur - 30) p = 100;
+    if (p <= 0 || p >= 100 || t <= 0) return;
+    tmdbSyncGuard(hash, p);
+    try {
+      Lampa.Timeline.update({
+        hash: hash,
+        percent: p,
+        time: t,
+        duration: dur,
+        profile: 0,
+        updated: Date.now(),
+      });
+    } catch (e) { }
+  }
+
+  function tmdbSyncFetchMeta(tmdb) {
+    if (!tmdb || !tmdb.id) return Promise.resolve(null);
+    return fetchTmdbMeta({ method: String(tmdb.method || ''), id: String(tmdb.id) });
+  }
+
+  function tmdbSyncMarkMovie(tmdb, played) {
+    if (!tmdb || String(tmdb.method) !== 'movie') return Promise.resolve();
+    return tmdbSyncFetchMeta(tmdb)
+      .then(function (meta) {
+        if (!meta || !meta.originalTitle) return;
+        tmdbSyncWriteHash(tmdbMovieHash(meta.originalTitle), played ? 100 : 0);
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncMarkEpisode(tmdb, season, episode, played) {
+    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
+    if (!(Number(season) > 0) || !(Number(episode) > 0)) return Promise.resolve();
+    return tmdbSyncFetchMeta(tmdb)
+      .then(function (meta) {
+        var name = meta && (meta.originalName || meta.originalTitle);
+        if (!name) return;
+        tmdbSyncWriteHash(tmdbEpisodeHash(name, season, episode), played ? 100 : 0);
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncSeriesEpisodes(seriesId) {
+    if (!seriesId) return Promise.resolve([]);
+    var key = String(seriesId);
+    var cached = tmdbSync.episodesCache[key];
+    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return Promise.resolve(cached.rows);
+    if (tmdbSync.episodesInflight[key]) return tmdbSync.episodesInflight[key];
+    var inflight = fetchEpisodes(key)
+      .then(function (rows) {
+        tmdbSync.episodesCache[key] = { at: Date.now(), rows: rows || [] };
+        return rows || [];
+      })
+      .finally(function () {
+        delete tmdbSync.episodesInflight[key];
+      });
+    tmdbSync.episodesInflight[key] = inflight;
+    return inflight;
+  }
+
+  function tmdbSyncMarkSeriesAll(tmdb, played) {
+    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
+    return resolveTmdbJellyfinRowAsync(tmdb)
+      .then(function (seriesRow) {
+        if (!seriesRow || !seriesRow.id) return;
+        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
+          var items = [];
+          rows.forEach(function (r) {
+            if (!r.raw) return;
+            var n = episodeNumbers(r.raw);
+            if (n.season && n.episode) items.push(n);
+          });
+          if (!items.length) return;
+          return tmdbSyncFetchMeta(tmdb).then(function (meta) {
+            var name = meta && (meta.originalName || meta.originalTitle);
+            if (!name) return;
+            items.forEach(function (n) {
+              tmdbSyncWriteHash(tmdbEpisodeHash(name, n.season, n.episode), played ? 100 : 0);
+            });
+          });
+        });
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncSeriesByJellyfinId(seriesId) {
+    if (!seriesId) return null;
+    var keys = Object.keys(libraryIndex.byTmdb || {});
+    for (var i = 0; i < keys.length; i++) {
+      var row = libraryIndex.byTmdb[keys[i]];
+      if (!row || !row.raw) continue;
+      if (String(row.raw.Id || row.id) === String(seriesId) && String(row.type || row.raw.Type) === 'Series') return row;
+    }
+    return null;
+  }
+
+  function tmdbSyncApplyForRow(row, played) {
+    if (!tmdbSyncEnabled() || !row || !row.raw) return;
+    var type = String(row.type || row.raw.Type || '');
+    var tmdb = tmdbFromItem(row.raw);
+    if (!tmdb) return;
+    if (type === 'Movie') {
+      tmdbSyncMarkMovie(tmdb, played);
+      return;
+    }
+    if (type === 'Episode') {
+      if (!row.raw.SeriesId) return;
+      var sr = tmdbSyncSeriesByJellyfinId(row.raw.SeriesId);
+      if (!sr || !sr.tmdb) return;
+      var n = episodeNumbers(row.raw);
+      tmdbSyncMarkEpisode(sr.tmdb, n.season, n.episode, played);
+      return;
+    }
+    if (type === 'Series') {
+      tmdbSyncMarkSeriesAll(tmdb, played);
+    }
+  }
+
+  function tmdbResumeSecondsOf(row) {
+    if (!row) return 0;
+    var ud = (row.raw && row.raw.UserData) || {};
+    var resume = Number(row.resumeSec) || 0;
+    if (!resume && ud.PlaybackPositionTicks) resume = Math.round(Number(ud.PlaybackPositionTicks) / 10000000);
+    return Math.max(0, Number(resume) || 0);
+  }
+
+  function tmdbRowWatched(row) {
+    if (!row) return false;
+    var ud = (row.raw && row.raw.UserData) || {};
+    return !!(row.watched || ud.Played || Number(row.playedPct) >= 100);
+  }
+
+  function tmdbSyncApplyResumeMovie(tmdb, resume, duration) {
+    if (!tmdb || String(tmdb.method) !== 'movie') return Promise.resolve();
+    var pct = duration > 0 ? Math.min(100, Math.round((resume / duration) * 100)) : 0;
+    if (pct <= 0 || pct >= 90) return Promise.resolve();
+    return tmdbSyncFetchMeta(tmdb)
+      .then(function (meta) {
+        if (!meta || !meta.originalTitle) return;
+        tmdbSyncWriteTimeline(tmdbMovieHash(meta.originalTitle), pct, resume, duration);
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncApplyResumeSeries(tmdb) {
+    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
+    return resolveTmdbJellyfinRowAsync(tmdb)
+      .then(function (seriesRow) {
+        if (!seriesRow || !seriesRow.id) return;
+        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
+          var wants = [];
+          rows.forEach(function (r) {
+            if (!r.raw || tmdbRowWatched(r)) return;
+            var n = episodeNumbers(r.raw);
+            if (n.season && n.episode) {
+              var resume = tmdbResumeSecondsOf(r);
+              if (resume > 0) wants.push({ row: r, n: n, resume: resume });
+            }
+          });
+          if (!wants.length) return;
+          return tmdbSyncFetchMeta(tmdb).then(function (meta) {
+            var name = meta && (meta.originalName || meta.originalTitle);
+            if (!name) return;
+            wants.forEach(function (w) {
+              var dur = runtimeSecondsOf(w.row);
+              var pct = dur > 0 ? Math.min(100, Math.round((w.resume / dur) * 100)) : 0;
+              if (pct <= 0 || pct >= 90) return;
+              tmdbSyncWriteTimeline(tmdbEpisodeHash(name, w.n.season, w.n.episode), pct, w.resume, dur);
+            });
+          });
+        });
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncApplyResumeForRow(row) {
+    if (!tmdbSyncEnabled() || !row || !row.raw) return;
+    if (tmdbRowWatched(row)) return;
+    var type = String(row.type || row.raw.Type || '');
+    var tmdb = tmdbFromItem(row.raw);
+    if (!tmdb) return;
+    if (type === 'Movie') {
+      var resume = tmdbResumeSecondsOf(row);
+      var dur = runtimeSecondsOf(row);
+      if (resume > 0 && dur > 0) tmdbSyncApplyResumeMovie(tmdb, resume, dur);
+      return;
+    }
+    if (type === 'Series') {
+      tmdbSyncApplyResumeSeries(tmdb);
+      return;
+    }
+    if (type === 'Episode') {
+      if (!row.raw.SeriesId) return;
+      var sr = tmdbSyncSeriesByJellyfinId(row.raw.SeriesId);
+      if (!sr || !sr.tmdb) return;
+      var n = episodeNumbers(row.raw);
+      if (!n.season || !n.episode) return;
+      var resume2 = tmdbResumeSecondsOf(row);
+      var dur2 = runtimeSecondsOf(row);
+      if (resume2 <= 0 || dur2 <= 0) return;
+      tmdbSyncFetchMeta(sr.tmdb)
+        .then(function (meta) {
+          var name = meta && (meta.originalName || meta.originalTitle);
+          if (!name) return;
+          var pct = Math.min(100, Math.round((resume2 / dur2) * 100));
+          if (pct <= 0 || pct >= 90) return;
+          tmdbSyncWriteTimeline(tmdbEpisodeHash(name, n.season, n.episode), pct, resume2, dur2);
+        })
+        .catch(function () { });
+    }
+  }
+
+  function tmdbSyncBulkFromLibrary() {
+    if (!tmdbSyncEnabled()) return;
+    var rows = [];
+    var keys = Object.keys(libraryIndex.byTmdb || {});
+    keys.forEach(function (k) {
+      var row = libraryIndex.byTmdb[k];
+      if (!row || !row.tmdb) return;
+      if (tmdbRowWatched(row)) rows.push({ row: row, kind: 'watched' });
+      else if (tmdbResumeSecondsOf(row) > 0) rows.push({ row: row, kind: 'resume' });
+    });
+    if (!rows.length) return;
+    promiseAllChunks(rows, 4, function (entry) {
+      if (entry.kind === 'watched') return tmdbSyncApplyForRow(entry.row, true);
+      tmdbSyncApplyResumeForRow(entry.row);
+      return null;
+    }).catch(function () { });
+  }
+
+  function scheduleTmdbSyncFromLibrary() {
+    try {
+      if (tmdbSync.bulkTimer) clearTimeout(tmdbSync.bulkTimer);
+    } catch (e) { }
+    tmdbSync.bulkTimer = setTimeout(function () {
+      tmdbSync.bulkTimer = null;
+      tmdbSyncBulkFromLibrary();
+    }, 1500);
+  }
+
+  function resolveTmdbJellyfinRowAsync(tmdb) {
+    var row = findLibraryRow(String(tmdb.method || ''), String(tmdb.id || ''));
+    if (row) return Promise.resolve(row);
+    return refreshLibraryIndex(false).then(function () {
+      return findLibraryRow(String(tmdb.method || ''), String(tmdb.id || ''));
+    });
+  }
+
+  function tmdbPushItemPlayed(itemId, hash) {
+    return resolveUserId()
+      .then(function (userId) {
+        return jfHttp(
+          '/Users/' + encodeURIComponent(userId) + '/PlayedItems/' + encodeURIComponent(itemId),
+          { method: 'POST', jsonBody: {} }
+        );
+      })
+      .then(function () {
+        if (hash) tmdbSyncRememberPush(hash, 100);
+        invalidateUserDataCaches();
+      })
+      .catch(function () { });
+  }
+
+  function tmdbPushItemUnplayed(itemId, hash) {
+    return resolveUserId()
+      .then(function (userId) {
+        return jfHttp(
+          '/Users/' + encodeURIComponent(userId) + '/PlayedItems/' + encodeURIComponent(itemId),
+          { method: 'DELETE', dataType: 'text' }
+        );
+      })
+      .then(function () {
+        if (hash) tmdbSyncRememberPush(hash, 0);
+        invalidateUserDataCaches();
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncPlaybackSessionId() {
+    var s = '';
+    var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    for (var i = 0; i < 12; i++) {
+      s += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return s;
+  }
+
+  function tmdbSyncSessionSnapshot() {
+    var s = tmdbSync.session || {};
+    return {
+      hash: s.hash || '',
+      itemId: s.itemId || '',
+      userId: s.userId || '',
+      mediaSourceId: s.mediaSourceId || '',
+      playSessionId: s.playSessionId || '',
+      playMethod: s.playMethod || 'DirectStream',
+      positionSec: Number(s.positionSec) || 0,
+      durationSec: Number(s.durationSec) || 0,
+      paused: !!s.paused,
+      started: !!s.started,
+    };
+  }
+
+  function sendTmdbSyncReport(method, snap) {
+    if (!snap || !snap.itemId || !apiBase() || !apiKey()) return Promise.resolve();
+    if (!snap.userId) snap.userId = String(storedUserId() || cachedUserId || '');
+    if (!snap.userId) return Promise.resolve();
+    var path = '/Sessions/Playing';
+    if (method === 'progress') path += '/Progress';
+    else if (method === 'stopped') path += '/Stopped';
+    var body = {
+      ItemId: snap.itemId,
+      UserId: snap.userId,
+      PlaySessionId: snap.playSessionId,
+      PositionTicks: secondsToTicks(snap.positionSec),
+      IsPaused: !!snap.paused,
+      IsMuted: false,
+      VolumeLevel: 100,
+      PlayMethod: snap.playMethod || 'DirectStream',
+      CanSeek: true,
+    };
+    if (snap.mediaSourceId) body.MediaSourceId = snap.mediaSourceId;
+    if (method === 'stopped') body.Failed = false;
+    return jfHttp(path, { method: 'POST', jsonBody: body, cache: false }).catch(function () { });
+  }
+
+  function scheduleTmdbSyncSessionRepeat() {
+    try {
+      if (tmdbSync.sessionTimer) clearTimeout(tmdbSync.sessionTimer);
+    } catch (e) { }
+    tmdbSync.sessionTimer = setTimeout(function () {
+      tmdbSync.sessionTimer = null;
+      if (tmdbSync.session && tmdbSync.session.itemId) {
+        flushTmdbSyncSession(false);
+        scheduleTmdbSyncSessionRepeat();
+      }
+    }, 10000);
+  }
+
+  function flushTmdbSyncSession(force) {
+    if (!tmdbSync.session || !tmdbSync.session.itemId) return;
+    var now = Date.now();
+    if (!force && now - (tmdbSync.session.lastReportAt || 0) < 10000) return;
+    if (tmdbSync.sessionBusy) {
+      tmdbSync.sessionQueued = true;
+      return;
+    }
+    tmdbSync.session.lastReportAt = now;
+    var snap = tmdbSyncSessionSnapshot();
+    var method = snap.started ? 'progress' : 'start';
+    if (method === 'start') tmdbSync.session.started = true;
+    tmdbSync.sessionBusy = true;
+    sendTmdbSyncReport(method, snap).finally(function () {
+      tmdbSync.sessionBusy = false;
+      if (tmdbSync.sessionQueued) {
+        tmdbSync.sessionQueued = false;
+        flushTmdbSyncSession(true);
+      }
+    });
+  }
+
+  function tmdbSyncReportSession(desc, t, dur) {
+    try {
+      if (!tmdbSyncEnabled() || !desc || !desc.id) return;
+      t = Math.max(0, Number(t) || 0);
+      dur = Math.max(0, Number(dur) || 0);
+      if (dur <= 0 || t < 10) return;
+      var token = ++tmdbSync.sessionToken;
+
+      if (tmdbSync.session && String(tmdbSync.session.hash) !== String(desc.hash)) {
+        var old = tmdbSync.session;
+        tmdbSync.session = null;
+        tmdbSync.sessionQueued = false;
+        tmdbSyncSessionStopSchedule();
+        sendTmdbSyncReport('stopped', old);
+      }
+
+      if (tmdbSync.session && tmdbSync.session.itemId) {
+        tmdbSync.session.positionSec = t;
+        tmdbSync.session.durationSec = dur;
+        tmdbSync.session.paused = !!tmdbSync.sessionPaused;
+        flushTmdbSyncSession(false);
+        return;
+      }
+
+      var userId = '';
+      resolveUserId()
+        .then(function (uid) {
+          userId = uid;
+          if (token !== tmdbSync.sessionToken) return null;
+          return resolveTmdbJellyfinRowAsync({ method: String(desc.method || 'movie'), id: String(desc.id) });
+        })
+        .then(function (row) {
+          if (token !== tmdbSync.sessionToken || !row || !row.id) return null;
+          if (desc.season && desc.episode && String(row.type || row.raw.Type) === 'Series') {
+            return tmdbSyncSeriesEpisodes(row.id).then(function () {
+              if (token !== tmdbSync.sessionToken) return null;
+              var ep = tmdbFindEpisodeRow(row, desc.season, desc.episode);
+              return ep && ep.id ? ep : null;
+            });
+          }
+          return row;
+        })
+        .then(function (row) {
+          if (token !== tmdbSync.sessionToken || !row) return;
+          tmdbSync.session = {
+            hash: String(desc.hash),
+            itemId: String(row.id),
+            userId: String(userId || ''),
+            mediaSourceId: row.mediaSourceId ||
+              (row.raw && row.raw.MediaSources && row.raw.MediaSources[0] && row.raw.MediaSources[0].Id) || '',
+            playSessionId: tmdbSyncPlaybackSessionId(),
+            positionSec: t,
+            durationSec: dur,
+            paused: !!tmdbSync.sessionPaused,
+            lastReportAt: 0,
+            started: false,
+          };
+          flushTmdbSyncSession(true);
+          scheduleTmdbSyncSessionRepeat();
+        });
+    } catch (e) { }
+  }
+
+  function tmdbSyncStopSession() {
+    if (!tmdbSync.session || !tmdbSync.session.itemId) return;
+    var old = tmdbSync.session;
+    tmdbSync.session = null;
+    tmdbSync.sessionQueued = false;
+    tmdbSync.sessionToken++;
+    tmdbSyncSessionStopSchedule();
+    sendTmdbSyncReport('stopped', old);
+  }
+
+  function tmdbSyncSessionStopSchedule() {
+    try {
+      if (tmdbSync.sessionTimer) clearTimeout(tmdbSync.sessionTimer);
+    } catch (e) { }
+    tmdbSync.sessionTimer = null;
+  }
+
+  function tmdbPushWatchedDesc(desc) {
+    if (!desc || !desc.id) return;
+    var hash = desc.hash;
+    if (!tmdbSyncShouldPush(hash, 100)) return;
+    var method = desc.method || (desc.originalName ? 'tv' : 'movie');
+    if (method === 'movie') {
+      resolveTmdbJellyfinRowAsync({ method: 'movie', id: String(desc.id) })
+        .then(function (row) {
+          if (!row || !row.id) return;
+          if (!tmdbSyncShouldPush(hash, 100)) return;
+          tmdbPushItemPlayed(row.id, hash);
+        })
+        .catch(function () { });
+      return;
+    }
+    if (!(Number(desc.season) > 0) || !(Number(desc.episode) > 0)) return;
+    resolveTmdbJellyfinRowAsync({ method: 'tv', id: String(desc.id) })
+      .then(function (row) {
+        if (!row || !row.id) return;
+        return tmdbSyncSeriesEpisodes(row.id).then(function () {
+          if (!tmdbSyncShouldPush(hash, 100)) return;
+          var epRow = tmdbFindEpisodeRow(row, desc.season, desc.episode);
+          if (!epRow || !epRow.id) return;
+          tmdbPushItemPlayed(epRow.id, hash);
+        });
+      })
+      .catch(function () { });
+  }
+
+  function tmdbPushUnwatchedDesc(desc) {
+    if (!desc || !desc.id) return;
+    var hash = desc.hash;
+    if (!tmdbSyncShouldPush(hash, 0)) return;
+    var method = desc.method || (desc.originalName ? 'tv' : 'movie');
+    if (method === 'movie') {
+      resolveTmdbJellyfinRowAsync({ method: 'movie', id: String(desc.id) })
+        .then(function (row) {
+          if (!row || !row.id) return;
+          if (!tmdbSyncShouldPush(hash, 0)) return;
+          tmdbPushItemUnplayed(row.id, hash);
+        })
+        .catch(function () { });
+      return;
+    }
+    if (!(Number(desc.season) > 0) || !(Number(desc.episode) > 0)) return;
+    resolveTmdbJellyfinRowAsync({ method: 'tv', id: String(desc.id) })
+      .then(function (row) {
+        if (!row || !row.id) return;
+        return tmdbSyncSeriesEpisodes(row.id).then(function () {
+          if (!tmdbSyncShouldPush(hash, 0)) return;
+          var epRow = tmdbFindEpisodeRow(row, desc.season, desc.episode);
+          if (!epRow || !epRow.id) return;
+          tmdbPushItemUnplayed(epRow.id, hash);
+        });
+      })
+      .catch(function () { });
+  }
+
+  function tmdbFindEpisodeRow(seriesRow, season, episode) {
+    var rows = (tmdbSync.episodesCache[seriesRow.id] && tmdbSync.episodesCache[seriesRow.id].rows) || [];
+    for (var i = 0; i < rows.length; i++) {
+      var n = episodeNumbers(rows[i].raw);
+      if (n.season === Number(season) && n.episode === Number(episode)) return rows[i];
+    }
+    return null;
+  }
+
+  function tmdbSyncDescriptor(hash, method, id, season, episode) {
+    if (!hash || !id) return;
+    for (var i = 0; i < tmdbSync.active.length; i++) {
+      if (String(tmdbSync.active[i].hash) === String(hash)) {
+        tmdbSync.active[i].method = method;
+        tmdbSync.active[i].id = String(id);
+        if (season !== undefined) tmdbSync.active[i].season = season;
+        if (episode !== undefined) tmdbSync.active[i].episode = episode;
+        return;
+      }
+    }
+    tmdbSync.active.push({ hash: String(hash), method: method, id: String(id), season: season, episode: episode });
+    if (tmdbSync.active.length > 40) tmdbSync.active.splice(0, tmdbSync.active.length - 40);
+  }
+
+  function tmdbSyncDescriptorByHash(hash) {
+    if (!hash) return null;
+    for (var i = 0; i < tmdbSync.active.length; i++) {
+      if (String(tmdbSync.active[i].hash) === String(hash)) return tmdbSync.active[i];
+    }
+    return null;
+  }
+
+  function tmdbSyncPlayCard(data) {
+    if (!data) return null;
+    var card = data.card || data.movie ||
+      (data.element && (data.element.card || data.element.movie)) || null;
+    if (!card || typeof card !== 'object' || card.ProviderIds || card.jellyfinId) return null;
+    return card;
+  }
+
+  function tmdbSyncPlayNumbers(data, card) {
+    var season = Number(data && (data.season_number != null ? data.season_number : data.season));
+    var episode = Number(data && (data.episode_number != null ? data.episode_number : data.episode));
+    if ((!season || !episode) && card) {
+      season = Number(card.season_number != null ? card.season_number : card.season);
+      episode = Number(card.episode_number != null ? card.episode_number : card.episode);
+    }
+    if (!season || !episode) return null;
+    return { season: season, episode: episode };
+  }
+
+  function tmdbSyncPlayTmdb(data, card) {
+    if (!card || !card.id) return null;
+    var method = String(card.method || data.method || card.media_type || '').toLowerCase();
+    if (method !== 'movie' && method !== 'tv') {
+      method =
+        card.name || card.original_name || card.first_air_date ||
+        card.number_of_seasons || tmdbSyncPlayNumbers(data, card) ? 'tv' : 'movie';
+    }
+    return { method: method, id: String(card.id) };
+  }
+
+  function tmdbSyncRegisterPlayData(data) {
+    try {
+      if (!tmdbSyncEnabled() || !data || data.jellyfinPlayback || data.jellyfinId) return;
+    } catch (e) { return; }
+    var card = tmdbSyncPlayCard(data);
+    var tmdb = tmdbSyncPlayTmdb(data, card);
+    if (!tmdb || !card) return;
+    var numbers = tmdbSyncPlayNumbers(data, card);
+    var title = card.original_name || card.originalTitle || card.original_title || '';
+    if (tmdb.method === 'tv' && numbers) {
+      var orig = title || card.title || '';
+      if (orig) {
+        tmdbSyncDescriptor(tmdbEpisodeHash(orig, numbers.season, numbers.episode), 'tv', tmdb.id, numbers.season, numbers.episode);
+      }
+      return;
+    }
+    if (tmdb.method === 'movie' && (card.original_title || card.originalTitle)) {
+      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', tmdb.id);
+    }
+  }
+
+  function tmdbSyncSyncSeriesFromJellyfin(row) {
+    if (!tmdbSyncEnabled() || !row || !row.id || !row.tmdb) return Promise.resolve();
+    return tmdbSyncSeriesEpisodes(row.id)
+      .then(function (rows) {
+        var wants = rows.filter(function (r) {
+          return r.raw &&
+            (r.watched ||
+              Number(r.playedPct) >= 90 ||
+              !!(r.raw.UserData && r.raw.UserData.Played));
+        });
+        if (!wants.length) return;
+        return tmdbSyncFetchMeta(row.tmdb).then(function (meta) {
+          var name = meta && (meta.originalName || meta.originalTitle);
+          if (!name) return;
+          wants.forEach(function (r) {
+            var n = episodeNumbers(r.raw);
+            if (n.season && n.episode) {
+              tmdbSyncWriteHash(tmdbEpisodeHash(name, n.season, n.episode), 100);
+            }
+          });
+        });
+      })
+      .catch(function () { });
+  }
+
+  function tmdbSyncRegisterCard(object) {
+    try {
+      if (!tmdbSyncEnabled() || !object) return;
+    } catch (e) { return; }
+    var method = String(object.method || '');
+    var id = String(object.id || (object.card && object.card.id) || '');
+    var isJellyfin = !!(
+      object.jellyfinRow ||
+      object.source === 'jellyfin' ||
+      (object.card && object.card.source === 'jellyfin')
+    );
+    if (isJellyfin || !method || !id) return;
+    var card = object.card || object;
+    if (method === 'movie' && (card.original_title || card.originalTitle)) {
+      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', id);
+      resolveTmdbJellyfinRowAsync({ method: 'movie', id: id })
+        .then(function (resolved) {
+          if (resolved && resolved.tmdb) {
+            try {
+              tmdbSyncApplyResumeForRow(resolved);
+            } catch (err) { }
+          }
+        })
+        .catch(function () { });
+      return;
+    }
+    if (method === 'tv') {
+      resolveTmdbJellyfinRowAsync({ method: 'tv', id: id })
+        .then(function (resolved) {
+          if (resolved && resolved.tmdb) {
+            try {
+              tmdbSyncSyncSeriesFromJellyfin(resolved);
+            } catch (err) { }
+            try {
+              tmdbSyncApplyResumeForRow(resolved);
+            } catch (err) { }
+          }
+        })
+        .catch(function () { });
+    }
+  }
+
+  function tmdbSyncRegisterPlayerItem(item) {
+    try {
+      if (!tmdbSyncEnabled() || !item || item.jellyfinId) return;
+    } catch (e) { return; }
+    var card = (item && (item.card || (item.data && item.data.card))) || null;
+    if (!card || !card.id) return;
+    var id = String(card.id);
+    var season = item.season != null ? Number(item.season) : 0;
+    var episode = item.episode != null ? Number(item.episode) : 0;
+    var title = card.original_name || card.originalTitle || card.original_title || '';
+    if (season > 0 && episode > 0 && (title || card.title)) {
+      var orig = title || card.title || '';
+      tmdbSyncDescriptor(tmdbEpisodeHash(orig, season, episode), 'tv', id, season, episode);
+      return;
+    }
+    if (card.original_title || card.originalTitle) {
+      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', id);
+    }
+  }
+
+  function tmdbSyncBeginJfMirror(row) {
+    try {
+      if (!tmdbSyncEnabled() || !row || !row.raw) return;
+      var type = String(row.type || row.raw.Type || '');
+      var tmdb = tmdbFromItem(row.raw);
+      if (!tmdb) return;
+      var seriesTmdb = tmdb;
+      if (type === 'Episode') {
+        if (!row.raw.SeriesId) return;
+        var sr = tmdbSyncSeriesByJellyfinId(row.raw.SeriesId);
+        if (!sr || !sr.tmdb) return;
+        seriesTmdb = sr.tmdb;
+      }
+      tmdbSyncFetchMeta(seriesTmdb)
+        .then(function (meta) {
+          if (type === 'Episode') {
+            var numbers = episodeNumbers(row.raw);
+            var name = meta && (meta.originalName || meta.originalTitle);
+            if (!name || !numbers.season || !numbers.episode) return;
+            tmdbSync.jfActiveHash = String(tmdbEpisodeHash(name, numbers.season, numbers.episode));
+          } else {
+            var mname = meta && meta.originalTitle;
+            if (!mname) return;
+            tmdbSync.jfActiveHash = String(tmdbMovieHash(mname));
+          }
+          tmdbSync.jfLastWriteAt = 0;
+        })
+        .catch(function () { });
+    } catch (e) { }
+  }
+
+  function tmdbSyncClearJfMirror() {
+    tmdbSync.jfActiveHash = '';
+    tmdbSync.jfLastWriteAt = 0;
+  }
+
+  function tmdbSyncApplyRealtimeMirror(pct, tsec, dsec) {
+    if (!tmdbSyncEnabled()) return;
+    var hash = tmdbSync.jfActiveHash;
+    if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
+    var now = Date.now();
+    if (now - (tmdbSync.jfLastWriteAt || 0) < 10000) return;
+    var dur = Number(dsec) || 0;
+    var t = Number(tsec) || 0;
+    if (dur <= 0 || t <= 0) return;
+    var p = Number(pct);
+    if (!isFinite(p) || p < 0) p = 0;
+    if (t >= dur - 15) p = 100;
+    if (p <= 0) return;
+    tmdbSync.jfLastWriteAt = now;
+    try {
+      Lampa.Timeline.update({
+        hash: hash,
+        percent: Math.min(100, p),
+        time: p >= 100 ? 0 : t,
+        duration: dur,
+        profile: 0,
+        updated: Date.now(),
+      });
+    } catch (e) { }
+  }
+
+  function tmdbSyncOnTimelineUpdate(e) {
+    if (!tmdbSyncEnabled()) return;
+    if (!e || !e.data) return;
+    var hash = String(e.data.hash || '');
+    if (!hash) return;
+    if (String(hash) === String(syncingTimelineHash || '')) return;
+    if (String(hash) === String(currentTimelineHash || '')) return;
+    if (tmdbSync.jfActiveHash && String(hash) === String(tmdbSync.jfActiveHash)) return;
+    var road = e.data.road || {};
+    var pct = Number(road.percent) || 0;
+    if (tmdbSyncGuardHit(hash, pct)) return;
+    var desc = tmdbSyncDescriptorByHash(hash);
+    if (!desc && readPlaydata) {
+      var pd = readPlaydata();
+      if (pd) {
+        tmdbSyncRegisterPlayData(pd.item || pd);
+        tmdbSyncRegisterPlayerItem(pd.item || pd);
+      }
+      desc = tmdbSyncDescriptorByHash(hash);
+    }
+    if (!desc) return;
+    if (pct >= 90) {
+      tmdbSyncStopSession();
+      tmdbPushWatchedDesc(desc);
+    } else if (pct === 0) {
+      tmdbSyncStopSession();
+      tmdbPushUnwatchedDesc(desc);
+    } else {
+      tmdbSyncReportSession(desc, Number(road.time) || 0, Number(road.duration) || 0);
+    }
+  }
+
   var initDone = false;
   function init() {
     if (initDone) return;
@@ -11630,8 +12547,10 @@
       Lampa.Player.listener.follow('destroy', handlePlayerDestroy);
       Lampa.Player.listener.follow('end', handlePlayerDestroy);
       Lampa.Player.listener.follow('finish', handlePlayerDestroy);
+      Lampa.Player.listener.follow('start', tmdbSyncRegisterPlayData);
       Lampa.Player.listener.follow('ready', function (e) {
         var item = (e && (e.item || e.data)) || e || {};
+        tmdbSyncRegisterPlayerItem(item);
         if (item && item.jellyfinId) {
           lastCompletedRowId = null;
           lastProgressResetRowId = null;
@@ -11644,6 +12563,9 @@
           if (readyRow) {
             currentPlayRow = readyRow;
             currentTimelineHash = timelineHashFor(readyRow) || currentTimelineHash;
+            try {
+              tmdbSyncBeginJfMirror(readyRow);
+            } catch (err) { }
           }
           if (externalPlay && !usesLampaNativePlayer()) {
             var readyRow = findPlaybackRow(item.jellyfinId);
@@ -11676,6 +12598,15 @@
       });
     }
 
+    if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
+      Lampa.PlayerVideo.listener.follow('pause', function () {
+        tmdbSync.sessionPaused = true;
+      });
+      Lampa.PlayerVideo.listener.follow('play', function () {
+        tmdbSync.sessionPaused = false;
+      });
+    }
+
     installQualitySwitchHandler();
     installJellyfinPlaylist();
     disablePlayerDownPlaylist();
@@ -11701,6 +12632,8 @@
           road.duration
         );
       });
+
+      Lampa.Timeline.listener.follow('update', tmdbSyncOnTimelineUpdate);
     }
 
     if (document.addEventListener) {
@@ -11750,7 +12683,11 @@
     } catch (e) { }
 
     prefetchAutoUser();
-    refreshLibraryIndex(false).catch(function () { });
+    refreshLibraryIndex(false)
+      .then(function () {
+        scheduleTmdbSyncFromLibrary();
+      })
+      .catch(function () { });
   }
 
   if (window.appready) init();
