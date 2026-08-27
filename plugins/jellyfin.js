@@ -4685,6 +4685,45 @@
     }
   }
 
+  function rowHasAnyProgress(row) {
+    if (!row) return false;
+    var ud = row.raw && row.raw.UserData ? row.raw.UserData : {};
+    return !!(
+      row.watched ||
+      Number(row.playedPct) > 0 ||
+      Number(row.resumeSec) > 0 ||
+      ud.Played ||
+      Number(ud.PlayedPercentage) > 0 ||
+      Number(ud.PlaybackPositionTicks) > 0
+    );
+  }
+
+  function syncResolvedHistory(row) {
+    if (!row || !apiBase() || !apiKey()) return Promise.resolve();
+    try {
+      if (!Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return Promise.resolve();
+    } catch (e) {
+      return Promise.resolve();
+    }
+    var isSeries =
+      row.type === 'Series' || (row.raw && row.raw.Type === 'Series');
+    if (!isSeries) {
+      if (rowHasAnyProgress(row)) {
+        syncExternalTimeline(row, row.resumeSec || 0, runtimeSecondsOf(row));
+      }
+      return Promise.resolve();
+    }
+    return fetchEpisodes(row.id)
+      .then(function (eps) {
+        (eps || []).forEach(function (ep) {
+          if (rowHasAnyProgress(ep)) {
+            syncExternalTimeline(ep, ep.resumeSec || 0, runtimeSecondsOf(ep));
+          }
+        });
+      })
+      .catch(function () { });
+  }
+
   function launchPlayerFromSelect(ctl, launch) {
     restoreControllerNow(ctl);
     launch();
@@ -5663,9 +5702,6 @@
 
   function prepareEpisodeSwitch(item) {
     if (!item || !item.timeline) return;
-    item.timeline.time = 0;
-    item.timeline.percent = 0;
-    item.timeline.duration = 0;
     var id = item.jellyfinId || (item.item && item.item.jellyfinId) || '';
     if (!id) return;
     var row = findPlaybackRow(id);
@@ -6022,7 +6058,19 @@
   }
 
   function handleMediaPause(ev) {
+    if (externalPlay && externalPlay.rowId) {
+      if (!externalPausedAt) {
+        externalPausedAt = Date.now();
+        var pstate = externalPlaybackEstimate();
+        if (pstate && currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)) {
+          cachePlaybackState(externalPlay.rowId, externalPlay.type, pstate.pct, pstate.time, pstate.duration);
+          reportPlaybackProgress(currentPlayRow, pstate.pct, pstate.time, pstate.duration);
+        }
+      }
+      return;
+    }
     if (!isPluginVideoEl(ev && ev.target)) return;
+    if (!currentPlayRow || !currentPlayRow.raw) return;
     rtIsPaused = true;
     var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
     if (state) {
@@ -6034,18 +6082,19 @@
         { force: true }
       );
     }
-    if (externalPlay && externalPlay.rowId && !externalPausedAt) {
-      externalPausedAt = Date.now();
-    }
   }
 
   function handleMediaPlay(ev) {
-    if (!isPluginVideoEl(ev && ev.target)) return;
-    rtIsPaused = false;
-    if (externalPlay && externalPlay.rowId && externalPausedAt) {
-      externalPausedTotalMs += Date.now() - externalPausedAt;
-      externalPausedAt = 0;
+    if (externalPlay && externalPlay.rowId) {
+      if (externalPausedAt) {
+        externalPausedTotalMs += Date.now() - externalPausedAt;
+        externalPausedAt = 0;
+      }
+      return;
     }
+    if (!isPluginVideoEl(ev && ev.target)) return;
+    if (!currentPlayRow || !currentPlayRow.raw) return;
+    rtIsPaused = false;
     var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
     if (state) {
       reportPlaybackProgress(
@@ -6207,7 +6256,7 @@
     var pct = dur > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
     cachePlaybackState(externalPlay.rowId, externalPlay.type, pct, t, dur);
     if (currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)) {
-      reportPlaybackProgress(currentPlayRow, pct, t, dur);
+      reportPlaybackProgress(currentPlayRow, pct, t, dur, { realtime: true });
     }
   }
 
@@ -6619,6 +6668,10 @@
           currentSeason = typeof sel.season !== 'undefined' ? sel.season : 0;
           buildFilter();
           renderEpisodes();
+          deferControllerToggle('jellyfin_episodes');
+        },
+        onBack: function () {
+          deferControllerToggle('jellyfin_episodes');
         },
       });
     }
@@ -6689,7 +6742,7 @@
 
     this.start = function () {
       self.background();
-      Lampa.Controller.add('content', {
+      Lampa.Controller.add('jellyfin_episodes', {
         link: self,
         toggle: function () {
           scroll.restorePosition();
@@ -6727,7 +6780,7 @@
         },
         back: self.back,
       });
-      Lampa.Controller.toggle('content');
+      Lampa.Controller.toggle('jellyfin_episodes');
     };
 
     this.background = function () {
@@ -6985,6 +7038,10 @@
             return;
           }
           if (eps.length === 1) {
+            playRow(eps[0], eps);
+            return;
+          }
+          if (usesLampaNativePlayer()) {
             playRow(eps[0], eps);
             return;
           }
@@ -9962,11 +10019,14 @@
       var cached = findLibraryRow(method, id);
       if (cached) {
         mountButton(cached);
+        syncResolvedHistory(cached);
         return;
       }
 
       refreshLibraryIndex(false).then(function () {
-        mountButton(findLibraryRow(method, id));
+        var resolved = findLibraryRow(method, id);
+        mountButton(resolved);
+        if (resolved) syncResolvedHistory(resolved);
       });
     });
   }
@@ -11126,97 +11186,188 @@
       (w0 && (w0.jellyfinId || (w0.item && w0.item.jellyfinId))) ||
       ''
     );
-    var needSelect = null;
-    var $rows = $(
-      '<div class="jellyfin-episodes-list__rows jellyfin-player-playlist__rows"></div>'
-    );
-    var $list = $('<div class="jellyfin-player-playlist"></div>').append($rows);
-    playlistLiveRows = {};
-    items.forEach(function (item, idx) {
-      refreshPlaylistItemDisplay(item);
-      var $row = makePlayerPlaylistRowDom(item);
-      $row.attr('data-index', idx);
-      if (item && item._display && item._display.id) {
-        playlistLiveRows[item._display.id] = { item: item, $row: $row };
-      }
-      var isCurrent = !!(item && item.selected);
-      if (
-        !isCurrent &&
-        item &&
-        item.jellyfinId &&
-        currentId &&
-        String(item.jellyfinId) === currentId
-      ) {
-        isCurrent = true;
-      }
-      if (isCurrent) {
-        $row.addClass('jellyfin-episode--current');
-        if (!needSelect) needSelect = $row[0];
-      }
-      $rows.append($row);
-    });
-    if (!needSelect) needSelect = $rows.children().first()[0];
-    Lampa.Modal.open({
-      title: Lampa.Lang.translate('player_playlist'),
-      html: $list,
-      size: 'medium',
-      jellyfinRight: true,
-      scroll: { mask: true },
-      select: needSelect,
-      onSelect: function ($target) {
-        var $t = $target && $target.jquery ? $target : $($target || []);
-        var $ringRow = $t.closest('.jellyfin-episode');
-        if (
-          $ringRow.length &&
-          ($ringRow.hasClass('jellyfin-ring-focus') ||
-            $t.closest('.jellyfin-episode__state').length)
-        ) {
-          var ringIdx = Number($ringRow.attr('data-index')) || 0;
-          var ringItem = items[ringIdx];
-          if (ringItem) {
-            togglePlaylistRowWatched(ringItem, $ringRow);
-          }
-          return;
-        }
-        var index = Number(($target && $target.attr && $target.attr('data-index')) || 0);
-        var it = items[index];
-        if (!it) return;
-        detachPlaylistKeyHandler();
-        playlistLiveRows = {};
-        stopPlaylistLiveTimer();
-        try {
-          Lampa.Modal.close();
-        } catch (e) { }
-        restoreControllerNow(ctl);
-        try {
-          prepareEpisodeSwitch(it);
-        } catch (e) { }
-        try {
-          Lampa.PlayerPlaylist.listener.send('select', {
-            playlist: items,
-            item: it,
-            position: index,
-          });
-        } catch (e) { }
-      },
-      onBack: function () {
-        detachPlaylistKeyHandler();
-        playlistLiveRows = {};
-        stopPlaylistLiveTimer();
-        try {
-          Lampa.Modal.close();
-        } catch (e) { }
-        restoreControllerNow(ctl);
-      },
-    });
-    try {
-      var $m = $('.modal').last();
-      if ($m && $m.length) $m.addClass('jellyfin-playlist-modal');
-    } catch (e) { }
-    attachPlaylistKeyHandler();
-    if (!playlistLiveTimer) {
-      playlistLiveTimer = setInterval(updatePlaylistLiveProgress, 1000);
+    var allItems = (items && items.slice()) || [];
+
+    function itemSeason(it) {
+      if (it && it._display && it._display.season != null) return Number(it._display.season);
+      if (it && it.season != null) return Number(it.season);
+      return 0;
     }
+
+    function playSeasonSeasons() {
+      var seasons = [];
+      var seen = {};
+      allItems.forEach(function (it) {
+        var s = itemSeason(it);
+        if (Object.prototype.hasOwnProperty.call(seen, s)) return;
+        seen[s] = true;
+        seasons.push(s);
+      });
+      seasons.sort(function (a, b) { return a - b; });
+      return seasons;
+    }
+
+    function open(filterSeason) {
+      var seasons = playSeasonSeasons();
+      var visible = allItems;
+      if (filterSeason > 0) {
+        visible = visible.filter(function (it) { return itemSeason(it) === filterSeason; });
+      }
+      var needSelectItem = null;
+      for (var vi = 0; vi < visible.length; vi++) {
+        var itv = visible[vi];
+        if (itv && (itv.selected || (itv.jellyfinId && currentId && String(itv.jellyfinId) === currentId))) {
+          needSelectItem = itv;
+          break;
+        }
+      }
+
+      try { Lampa.Modal.close(); } catch (e) { }
+      var $rows = $('<div class="jellyfin-episodes-list__rows jellyfin-player-playlist__rows"></div>');
+      var $filter = $('<div class="jellyfin-episodes__filter"></div>');
+      var $list = $('<div class="jellyfin-player-playlist"></div>').append($filter).append($rows);
+      playlistLiveRows = {};
+
+      if (seasons.length > 1) {
+        var $chip = $(
+          '<div class="simple-button simple-button--filter selector jellyfin-season-chip"><span></span><div></div></div>'
+        );
+        $chip
+          .find('span')
+          .text(Lampa.Lang.translate('jellyfin_episodes'));
+        $chip
+          .find('div')
+          .text(
+            filterSeason > 0
+              ? Lampa.Lang.translate('jellyfin_season') + ' ' + filterSeason
+              : Lampa.Lang.translate('jellyfin_all_seasons')
+          )
+          .removeClass('hide');
+        $chip.on('hover:enter', function () {
+          var choices = [{ title: Lampa.Lang.translate('jellyfin_all_seasons'), season: 0 }];
+          seasons.forEach(function (s) {
+            choices.push({ title: Lampa.Lang.translate('jellyfin_season') + ' ' + s, season: s });
+          });
+          Lampa.Select.show({
+            title: Lampa.Lang.translate('jellyfin_episodes'),
+            items: choices,
+            onSelect: function (sel) {
+              if (!sel) return;
+              var fs = sel.season != null ? sel.season : 0;
+              visible = allItems;
+              if (fs > 0) {
+                visible = visible.filter(function (it) { return itemSeason(it) === fs; });
+              }
+              $chip.find('div').text(
+                fs > 0
+                  ? Lampa.Lang.translate('jellyfin_season') + ' ' + fs
+                  : Lampa.Lang.translate('jellyfin_all_seasons')
+              ).removeClass('hide');
+              playlistLiveRows = {};
+              $rows.empty();
+              visible.forEach(function (item, idx) {
+                refreshPlaylistItemDisplay(item);
+                var $row = makePlayerPlaylistRowDom(item);
+                $row.attr('data-index', idx);
+                if (item && item._display && item._display.id) {
+                  playlistLiveRows[item._display.id] = { item: item, $row: $row };
+                }
+                if (item && item.jellyfinId && currentId && String(item.jellyfinId) === currentId) {
+                  $row.addClass('jellyfin-episode--current');
+                }
+                $rows.append($row);
+              });
+              try {
+                var cur = $rows.find('.jellyfin-episode--current')[0];
+                if (cur) cur.scrollIntoView({ block: 'center', behavior: 'auto' });
+              } catch (e) { }
+            },
+          });
+        });
+        $filter.append($chip);
+      }
+
+      var needSelect = null;
+      visible.forEach(function (item, idx) {
+        refreshPlaylistItemDisplay(item);
+        var $row = makePlayerPlaylistRowDom(item);
+        $row.attr('data-index', idx);
+        if (item && item._display && item._display.id) {
+          playlistLiveRows[item._display.id] = { item: item, $row: $row };
+        }
+        if (needSelectItem && item === needSelectItem) {
+          $row.addClass('jellyfin-episode--current');
+          if (!needSelect) needSelect = $row[0];
+        }
+        $rows.append($row);
+      });
+      if (!needSelect) needSelect = $rows.children().first()[0];
+
+      Lampa.Modal.open({
+        title: Lampa.Lang.translate('player_playlist'),
+        html: $list,
+        size: 'medium',
+        jellyfinRight: true,
+        scroll: { mask: true },
+        select: needSelect,
+        onSelect: function ($target) {
+          var $t = $target && $target.jquery ? $target : $($target || []);
+          var $ringRow = $t.closest('.jellyfin-episode');
+          if (
+            $ringRow.length &&
+            ($ringRow.hasClass('jellyfin-ring-focus') ||
+              $t.closest('.jellyfin-episode__state').length)
+          ) {
+            var ringIdx = Number($ringRow.attr('data-index')) || 0;
+            var ringItem = visible[ringIdx];
+            if (ringItem) {
+              togglePlaylistRowWatched(ringItem, $ringRow);
+            }
+            return;
+          }
+          var index = Number(($target && $target.attr && $target.attr('data-index')) || 0);
+          var it = visible[index];
+          if (!it) return;
+          detachPlaylistKeyHandler();
+          playlistLiveRows = {};
+          stopPlaylistLiveTimer();
+          try {
+            Lampa.Modal.close();
+          } catch (e) { }
+          restoreControllerNow(ctl);
+          try {
+            prepareEpisodeSwitch(it);
+          } catch (e) { }
+          try {
+            Lampa.PlayerPlaylist.listener.send('select', {
+              playlist: allItems,
+              item: it,
+              position: allItems.indexOf(it),
+            });
+          } catch (e) { }
+        },
+        onBack: function () {
+          detachPlaylistKeyHandler();
+          playlistLiveRows = {};
+          lastLivePlaylistId = null;
+          stopPlaylistLiveTimer();
+          try {
+            Lampa.Modal.close();
+          } catch (e) { }
+          restoreControllerNow(ctl);
+        },
+      });
+      try {
+        var $m = $('.modal').last();
+        if ($m && $m.length) $m.addClass('jellyfin-playlist-modal');
+      } catch (e) { }
+      attachPlaylistKeyHandler();
+      if (!playlistLiveTimer) {
+        playlistLiveTimer = setInterval(updatePlaylistLiveProgress, 1000);
+      }
+    }
+
+    open(0);
   }
 
   function installJellyfinPlaylist() {
@@ -11233,18 +11384,22 @@
         typeof Lampa.Modal.listener.on === 'function' &&
         !Lampa.Modal.__jellyfinRightPatched
       ) {
-        Lampa.Modal.listener.on('fullshow', function (e) {
-          if (e && e.active && e.active.jellyfinRight && e.html) {
-            e.html.addClass('jellyfin-playlist-modal');
-          }
-        });
-        Lampa.Modal.listener.on('close', function () {
-          detachPlaylistKeyHandler();
-          playlistLiveRows = {};
-          lastLivePlaylistId = null;
-          stopPlaylistLiveTimer();
-        });
         Lampa.Modal.__jellyfinRightPatched = true;
+        var modalListener = Lampa.Modal.listener;
+        var modalOn = typeof modalListener.on === 'function' ? 'on' : typeof modalListener.follow === 'function' ? 'follow' : null;
+        if (modalOn) {
+          modalListener[modalOn]('fullshow', function (e) {
+            if (e && e.active && e.active.jellyfinRight && e.html) {
+              e.html.addClass('jellyfin-playlist-modal');
+            }
+          });
+          modalListener[modalOn]('close', function () {
+            detachPlaylistKeyHandler();
+            playlistLiveRows = {};
+            lastLivePlaylistId = null;
+            stopPlaylistLiveTimer();
+          });
+        }
       }
 
       if (
@@ -11273,25 +11428,9 @@
           }
           if (evt === 'prev') {
             if (episodePrevButtonDisabled) return;
-            try { resetCurrentEpisodeProgress(); } catch (e) { }
-            try {
-              var ppl = Lampa.PlayerPlaylist.get() || [];
-              var pp = currentEpisodePosition(ppl);
-              if (pp !== null && pp !== undefined && ppl[pp - 1]) {
-                prepareEpisodeSwitch(ppl[pp - 1]);
-              }
-            } catch (e) { }
           }
           if (evt === 'next') {
             if (episodeNextButtonDisabled) return;
-            try { markCurrentEpisodeCompleted(); } catch (e) { }
-            try {
-              var npl = Lampa.PlayerPlaylist.get() || [];
-              var np = currentEpisodePosition(npl);
-              if (np !== null && np !== undefined && npl[np + 1]) {
-                prepareEpisodeSwitch(npl[np + 1]);
-              }
-            } catch (e) { }
           }
           return origPanelSend.call(this, evt, data);
         };
@@ -11350,7 +11489,7 @@
             }
           }
         } catch (e) { }
-        origShow();
+        origShow.apply(this, arguments);
       };
       Lampa.PlayerPlaylist.__jellyfinPatched = true;
     } catch (e) { }
@@ -11389,7 +11528,10 @@
     } catch (e) { }
   }
 
+  var initDone = false;
   function init() {
+    if (initDone) return;
+    initDone = true;
     if (window.lampa_settings && window.lampa_settings.read_only) return;
 
     addLang();
@@ -11446,6 +11588,17 @@
           if (readyRow) {
             currentPlayRow = readyRow;
             currentTimelineHash = timelineHashFor(readyRow) || currentTimelineHash;
+          }
+          if (externalPlay && !usesLampaNativePlayer()) {
+            var readyRow = findPlaybackRow(item.jellyfinId);
+            if (readyRow && readyRow.raw) {
+              externalPlay.rowId = readyRow.raw.Id;
+              externalPlay.type = String(readyRow.type || readyRow.raw.Type || '');
+              externalPlay.resumeSec = Math.max(0, Number(readyRow.resumeSec) || 0);
+              externalPlay.durationSec = Math.round((Number(readyRow.raw.RunTimeTicks) || 0) / 10000000);
+            }
+            externalPlay.startAt = Date.now();
+            resetExternalPauseTracking();
           }
           try {
             document.body.classList.add('jellyfin-playing');
@@ -11519,12 +11672,9 @@
             syncFlushPlaybackProgress(true);
           } else if (document.visibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
-              var finalEst = externalPlaybackEstimate();
-              externalPlayFinalTicks = finalEst ? secondsToTicks(finalEst.time || 0) : 0;
               syncFlushPlaybackProgress(true);
-              stopExternalPlaybackTicker();
-              externalPlayFinalSyncDone = true;
-              externalPlay = null;
+              externalPlayFinalSyncDone = false;
+              startExternalPlaybackTicker();
             }
           }
         });
@@ -11533,12 +11683,9 @@
             syncFlushPlaybackProgress(true);
           } else if (document.webkitVisibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
-              var finalEst = externalPlaybackEstimate();
-              externalPlayFinalTicks = finalEst ? secondsToTicks(finalEst.time || 0) : 0;
               syncFlushPlaybackProgress(true);
-              stopExternalPlaybackTicker();
-              externalPlayFinalSyncDone = true;
-              externalPlay = null;
+              externalPlayFinalSyncDone = false;
+              startExternalPlaybackTicker();
             }
           }
         });
