@@ -1201,6 +1201,13 @@
     var doTranscode = opts.forceTranscode ? true : transcodingEnabled();
 
     if (!doTranscode) {
+      if (
+        opts.startTicks !== null &&
+        opts.startTicks !== undefined &&
+        Number(opts.startTicks) > 0
+      ) {
+        parts.push('StartTimeTicks=' + encodeURIComponent(Math.round(Number(opts.startTicks))));
+      }
       parts.push('Static=true');
       return apiBase() + '/Videos/' + encodeURIComponent(id) + '/stream?' + parts.join('&');
     }
@@ -1228,6 +1235,13 @@
     parts.push('EnableFastSeek=true');
     appendTranscodeQualityParams(parts, opts.qualityPreset, format);
     return apiBase() + '/Videos/' + encodeURIComponent(id) + '/master.m3u8?' + parts.join('&');
+  }
+
+  function resolveHlsMediaPlaylistUrl(url) {
+    var s = String(url || '');
+    if (!s) return s;
+    if (!/\/master\.m3u8(?=\?|$)/i.test(s)) return s;
+    return s.replace(/\/master\.m3u8(?=\?|$)/i, '/main.m3u8');
   }
 
   function audioStreamUrl(itemId, opts) {
@@ -1280,12 +1294,14 @@
     if (!transcodingEnabled()) return null;
     var map = {};
     PLAYER_TRANSCODE_QUALITIES.forEach(function (entry) {
-      map[entry.key] = streamUrl(
-        itemId,
-        Object.assign({}, opts, {
-          qualityPreset: entry.preset,
-          playSessionId: makePlaySessionId(),
-        })
+      map[entry.key] = resolveHlsMediaPlaylistUrl(
+        streamUrl(
+          itemId,
+          Object.assign({}, opts, {
+            qualityPreset: entry.preset,
+            playSessionId: makePlaySessionId(),
+          })
+        )
       );
     });
     return map;
@@ -1522,7 +1538,7 @@
       var title = String(stream.DisplayTitle || stream.Language || 'Subtitle ' + (idx + 1));
       var track = {
         label: title,
-        url: subtitleStreamUrl(itemId, msId, idx, 'vtt'),
+        url: subtitleStreamUrl(itemId, msId, idx, 'srt'),
         selected: false,
       };
       if (stream.Language) track.flag = String(stream.Language).slice(0, 2).toLowerCase();
@@ -1562,6 +1578,9 @@
       format: format,
       qualityPreset: opts.qualityPreset || defaultKey,
     };
+    if (playTarget.resumeSec > 0) {
+      streamOpts.startTicks = Math.round(Number(playTarget.resumeSec) * 10000000);
+    }
     if (opts.forceTranscode) streamOpts.forceTranscode = true;
     if (currentAudioStreamIndex !== null && currentAudioStreamIndex !== undefined && currentAudioStreamIndex !== -1) {
       streamOpts.audioStreamIndex = currentAudioStreamIndex;
@@ -6705,6 +6724,36 @@
       $filterWrap.empty().append($chip);
     }
 
+    function chooseInitialSeason() {
+      if (!seasons.length) return 0;
+      function isWatched(r) {
+        var raw = (r && r.raw) || {};
+        var ud = raw.UserData || {};
+        return !!(
+          r &&
+          (r.watched ||
+            Number(r.playedPct || 0) >= 100 ||
+            ud.Played ||
+            Number(ud.PlayedPercentage || 0) >= 100)
+        );
+      }
+      function seasonOf(r) {
+        return episodeNumbers((r && r.raw) || {}).season;
+      }
+      var i, resume = null, firstUnwatched = null, lastWatched = null;
+      for (i = 0; i < allRows.length; i++) {
+        var r = allRows[i];
+        if (seasonOf(r) === 0) continue;
+        if (!resume && !isWatched(r) && Number(r.playedPct || 0) > 0) resume = seasonOf(r);
+        if (!firstUnwatched && !isWatched(r)) firstUnwatched = seasonOf(r);
+        if (isWatched(r)) lastWatched = seasonOf(r);
+      }
+      if (resume != null) return resume;
+      if (lastWatched != null) return lastWatched;
+      if (firstUnwatched != null) return firstUnwatched;
+      return Number(seasons[0]);
+    }
+
     function load() {
       if (loading) return;
       loading = true;
@@ -6724,6 +6773,7 @@
           seasons.sort(function (a, b) {
             return a - b;
           });
+          if (!currentSeason) currentSeason = chooseInitialSeason();
           buildFilter();
           renderEpisodes();
         })
