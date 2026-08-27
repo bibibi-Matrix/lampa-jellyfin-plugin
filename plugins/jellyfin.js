@@ -6511,6 +6511,7 @@
     var $rows = $('<div class="jellyfin-episodes-list__rows"></div>');
     var html = $('<div class="jellyfin-module"></div>');
     var $filterWrap = $('<div class="jellyfin-episodes__filter"></div>');
+    var $seasonChip = null;
     var allRows = [];
     var seasons = [];
     var currentSeason = 0;
@@ -6646,7 +6647,11 @@
         rowsById[String(row.id)] = { $row: $row, row: row };
         $rows.append($row);
       });
-      last = $rows.children().first()[0];
+      if ($seasonChip && $seasonChip.length) {
+        last = $seasonChip[0];
+      } else {
+        last = $rows.children().first()[0];
+      }
       scheduleReflowFocus(scroll, self, last, { animate: true });
     }
 
@@ -6685,6 +6690,7 @@
         '<div class="simple-button simple-button--filter selector jellyfin-season-chip">' +
         '<span></span><div></div></div>'
       );
+      $seasonChip = $chip;
       $chip.find('span').text(Lampa.Lang.translate('jellyfin_episodes'));
       $chip.find('div').text(currentSeasonLabel()).removeClass('hide');
       $chip.on('hover:focus', function () {
