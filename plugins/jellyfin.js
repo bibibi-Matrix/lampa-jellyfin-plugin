@@ -97,7 +97,12 @@
     version: '2.0.0 Beta 13',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
-    description: 'Browse and play your Jellyfin library in Lampa',
+    description:
+      'Ваша медиатека Jellyfin теперь прямо в Lampa: фильмы, сериалы, музыка и домашние видео в одном аккуратном интерфейсе. ' +
+      'Разделы «Продолжить просмотр», «Недавно добавлено» и «Далее» всегда под рукой, а при воспроизведении плагин сам подберёт ' +
+      'качество трансляции, при необходимости перекодирует видео на лету и покажет субтитры или нужную звуковую дорожку. ' +
+      'Jellyfin и Lampa всегда на одной волне: «просмотрено» и позиция воспроизведения синхронизируются в обе стороны, ' +
+      'так что можно спокойно продолжить с того места, где остановились.',
     component: SETTINGS_COMPONENT,
     icon:
       '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 512 512" fill="currentColor">' +
@@ -182,6 +187,17 @@
   function addLang() {
     Lampa.Lang.add({
       jellyfin_title: { en: 'Jellyfin', ru: 'Jellyfin' },
+      jellyfin_about: { en: 'About the plugin', ru: 'О плагине' },
+      jellyfin_about_name: { en: 'Plugin', ru: 'Плагин' },
+      jellyfin_about_version: { en: 'Version', ru: 'Версия' },
+      jellyfin_about_author: { en: 'Author', ru: 'Автор' },
+      jellyfin_about_thanks: { en: 'Acknowledgments', ru: 'Благодарность' },
+      jellyfin_about_thanks_text: {
+        en: 'Special thanks to @pavelpikta — this plugin grew out of his prototype, and without him none of this would exist.',
+        ru: 'Автор благодарит @pavelpikta: плагин вырос из его прототипа — и без него этих строк бы не было.',
+      },
+      jellyfin_about_description: { en: 'Description', ru: 'Описание' },
+      jellyfin_about_details: { en: 'Details', ru: 'Сведения' },
       jellyfin_home: { en: 'Main - Jellyfin', ru: 'Главная - Jellyfin' },
       jellyfin_movies: { en: 'Movies', ru: 'Фильмы' },
       jellyfin_series: { en: 'TV Series', ru: 'Сериалы' },
@@ -3330,6 +3346,16 @@
     mixed: 'CatMixed',
   };
 
+  var LIBRARY_CATEGORY_DEFAULT_OFF = {
+    movies: 0,
+    tvshows: 0,
+    music: 0,
+    books: 1,
+    homevideos: 0,
+    musicvideos: 1,
+    mixed: 1,
+  };
+
   function libraryCategoryKey(ct) {
     var s = String(ct || '').trim().toLowerCase();
     if (s === 'movies') return 'movies';
@@ -3351,7 +3377,7 @@
   function libraryCategoryEnabled(ct) {
     var key = libraryCategoryKey(ct);
     if (!key || !LIBRARY_CATEGORY_PARAM[key]) return true;
-    return storageToggle(LIBRARY_CATEGORY_PARAM[key], true);
+    return storageToggle(LIBRARY_CATEGORY_PARAM[key], !LIBRARY_CATEGORY_DEFAULT_OFF[key]);
   }
 
   function fetchLibraries() {
@@ -10618,6 +10644,17 @@
       'body.jellyfin-movie-playing .player-panel__prev,body.jellyfin-movie-playing .player-panel__next{display:none!important}' +
       'body.jellyfin-playing .player-panel__pip{display:none!important}' +
       'body.jellyfin-episode-prev-disabled .player-panel__prev,body.jellyfin-episode-next-disabled .player-panel__next{opacity:.3;pointer-events:none}' +
+      '.jellyfin-about__brand{display:flex;align-items:center;gap:1.2em;margin-bottom:2em}' +
+      '.jellyfin-about__icon{width:4.5em;height:4.5em;flex:0 0 auto}' +
+      '.jellyfin-about__icon svg{width:100%;height:100%}' +
+      '.jellyfin-about__name{font-size:1.5em;font-weight:700}' +
+      '.jellyfin-about__section{margin-bottom:2em}' +
+      '.jellyfin-about__section:last-child{margin-bottom:0}' +
+      '.jellyfin-about__heading{font-size:.9em;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.55);margin:0 0 .8em}' +
+      '.jellyfin-about__descr{font-size:1.2em;line-height:1.8}' +
+      '.jellyfin-about__thanks{font-size:1.15em;line-height:1.8}' +
+      '.jellyfin-about__link{color:#4aa8e0;text-decoration:underline;cursor:pointer}' +
+      '.jellyfin-about__link.focus{outline:none;background:rgba(255,255,255,.12);border-radius:.3em;padding:.05em .25em;margin:0 -.25em}' +
       '</style>'
     );
   }
@@ -10698,6 +10735,14 @@
     addDisplaySettings();
     addCategoriesSettings();
     addHlsSettings();
+
+    Lampa.SettingsApi.addParam({
+      component: SETTINGS_COMPONENT,
+      param: { type: 'button', name: STORAGE_PREFIX + 'About' },
+      field: { name: Lampa.Lang.translate('jellyfin_about') },
+      onChange: showJellyfinAbout,
+    });
+
     patchUrlInputEdit();
   }
 
@@ -11110,6 +11155,103 @@
     } catch (e) { }
   }
 
+  function showJellyfinAbout() {
+    try {
+      if (
+        typeof Lampa.Modal === 'undefined' ||
+        typeof Lampa.Modal.open !== 'function'
+      ) {
+        return;
+      }
+      var profileUrl = 'https://github.com/pavelpikta';
+      var modal = $(
+        '<div class="jellyfin-about">' +
+          '<div class="jellyfin-about__brand">' +
+          '<span class="jellyfin-about__icon">' + MANIFEST.icon + '</span>' +
+          '<span class="jellyfin-about__name"></span>' +
+          '</div>' +
+          '<div class="jellyfin-about__section">' +
+          '<div class="jellyfin-about__heading"></div>' +
+          '<div class="jellyfin-about__descr"></div>' +
+          '</div>' +
+          '<div class="jellyfin-about__section">' +
+          '<div class="jellyfin-about__heading"></div>' +
+          '<div class="jellyfin-about__thanks"></div>' +
+          '</div>' +
+          '<div class="jellyfin-about__section">' +
+          '<div class="jellyfin-about__heading"></div>' +
+          '<div class="extensions-info__footer"></div>' +
+          '</div>' +
+          '</div>'
+      );
+      modal.find('.jellyfin-about__name').text(MANIFEST.name);
+
+      var sections = modal.find('.jellyfin-about__section');
+      sections
+        .eq(0)
+        .find('.jellyfin-about__heading')
+        .text(Lampa.Lang.translate('jellyfin_about_description'));
+      sections
+        .eq(0)
+        .find('.jellyfin-about__descr')
+        .html(String(MANIFEST.description || '').replace(/\n/g, '<br>'));
+
+      sections
+        .eq(1)
+        .find('.jellyfin-about__heading')
+        .text(Lampa.Lang.translate('jellyfin_about_thanks'));
+      var thanksText = String(Lampa.Lang.translate('jellyfin_about_thanks_text'));
+      try {
+        thanksText = thanksText.replace(
+          '@pavelpikta',
+          '<a class="jellyfin-about__link selector" href="' +
+            profileUrl +
+            '">@pavelpikta</a>'
+        );
+      } catch (e) { }
+      sections.eq(1).find('.jellyfin-about__thanks').html(thanksText);
+      try {
+        $('.jellyfin-about__link', modal).on('hover:enter', function () {
+          if (typeof window !== 'undefined' && typeof window.open === 'function') {
+            window.open(profileUrl, '_blank');
+          }
+        });
+      } catch (e) { }
+
+      sections
+        .eq(2)
+        .find('.jellyfin-about__heading')
+        .text(Lampa.Lang.translate('jellyfin_about_details'));
+      var footer = sections.eq(2).find('.extensions-info__footer');
+
+      function addLabel(name, value) {
+        footer.append(
+          $(
+            '<div>' +
+              '<div class="extensions-info__label"></div>' +
+              '<div class="extensions-info__value"></div>' +
+              '</div>'
+          )
+            .find('.extensions-info__label').text(name).end()
+            .find('.extensions-info__value').text(value).end()
+        );
+      }
+
+      addLabel(Lampa.Lang.translate('jellyfin_about_name'), MANIFEST.name);
+      addLabel(Lampa.Lang.translate('jellyfin_about_version'), MANIFEST.version);
+      addLabel(Lampa.Lang.translate('jellyfin_about_author'), MANIFEST.author);
+
+      Lampa.Modal.open({
+        title: Lampa.Lang.translate('jellyfin_about'),
+        html: modal,
+        size: 'large',
+        onBack: function () {
+          if (typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+        },
+      });
+    } catch (e) { }
+  }
+
   function addApiSettings() {
     if (Lampa.Params && Lampa.Params.defaults) {
       Lampa.Params.defaults[STORAGE_PREFIX + 'Url'] = '';
@@ -11265,7 +11407,7 @@
         component: component,
         param: {
           type: 'trigger',
-          default: true,
+          default: !LIBRARY_CATEGORY_DEFAULT_OFF[key],
           name: STORAGE_PREFIX + LIBRARY_CATEGORY_PARAM[key],
         },
         field: { name: Lampa.Lang.translate(categoryLabels[key] || 'jellyfin_ct_default') },
