@@ -167,8 +167,6 @@
   var rtPlayerVideoHooked = false;
   var externalPausedTotalMs = 0;
   var externalPausedAt = 0;
-  var externalPlayFinalSyncDone = false;
-  var externalPlayFinalTicks = 0;
 
   function rtCancelPendingNet() {
     if (rtNetTimer) {
@@ -401,6 +399,17 @@
         en: 'Audio tracks & subtitles (transcode)',
         ru: 'Аудио-дорожки и субтитры (транскод)',
       },
+      jellyfin_set_ext_tracks: {
+        en: 'Audio tracks & subtitles (external player)',
+        ru: 'Аудио-дорожки и субтитры (внешний плеер)',
+      },
+      jellyfin_pick_tracks: {
+        en: 'Tracks & subtitles',
+        ru: 'Дорожки и субтитры',
+      },
+      jellyfin_subs_none: { en: 'Subtitles: off', ru: 'Субтитры: выкл' },
+      jellyfin_subs_auto: { en: 'Subtitles: auto', ru: 'Субтитры: авто' },
+      jellyfin_audio_default: { en: 'Audio: default', ru: 'Аудио: по умолч.' },
       jellyfin_quality_auto: { en: 'Auto', ru: 'Авто' },
       jellyfin_play_from_library: {
         en: 'Play from Jellyfin',
@@ -1133,6 +1142,11 @@
     return usesLampaNativePlayer() && transcodingEnabled() && storageToggle('TracksSubs', true);
   }
 
+  function externalTracksEnabled() {
+    if (usesLampaNativePlayer()) return false;
+    return storageToggle('TracksSubs', true) && storageToggle('ExternalTracks', true);
+  }
+
   var TRANSCODE_QUALITY_PRESETS = {
     '240p': {
       maxWidth: 480,
@@ -1615,14 +1629,32 @@
     if (!subs.length) return [];
     var itemId = playTarget.id;
     var msId = playTarget.mediaSourceId || itemId;
+    var prefLang = '';
+    try {
+      prefLang = String(Lampa.Storage.get(STORAGE_PREFIX + 'SubLang') || '');
+    } catch (e) { }
+    var matched = false;
     return subs.map(function (stream) {
       var idx = Number(stream.Index);
       if (!isFinite(idx) || idx < 0) idx = 0;
       var title = String(stream.DisplayTitle || stream.Language || 'Subtitle ' + (idx + 1));
+      var isSel = false;
+      if (prefLang && !matched) {
+        if (String(prefLang) === '__auto__') {
+          isSel = true;
+          matched = true;
+        } else {
+          var lang = String(stream.Language || '');
+          if (lang && String(lang).toLowerCase() === String(prefLang).toLowerCase()) {
+            isSel = true;
+            matched = true;
+          }
+        }
+      }
       var track = {
         label: title,
         url: subtitleStreamUrl(itemId, msId, idx, 'srt'),
-        selected: false,
+        selected: isSel,
       };
       if (stream.Language) track.flag = String(stream.Language).slice(0, 2).toLowerCase();
       return track;
@@ -1709,7 +1741,7 @@
       item.quality = qualityMapForLampa(qualityMap, playTarget.raw, lampaDefaultUrl);
     }
     if (
-      tracksSubsEnabled() &&
+      (tracksSubsEnabled() || externalTracksEnabled()) &&
       (row.type === 'Movie' || row.type === 'Episode')
     ) {
       var audioTracks = buildAudioTracks(playTarget, streamOpts, qualityMap, item, defaultKey);
@@ -2476,6 +2508,117 @@
     return out;
   }
 
+  function showExternalTracksPicker(row, allRows, opts, launch) {
+    var ctl = enabledControllerName();
+    var pickAudio = null;
+    var runLaunch = null;
+    try {
+      var playTarget = rowWithVariant(row, resolvePlayVariant(row) || {});
+      var ms = mediaSourceForPlayTarget(playTarget.raw, playTarget.mediaSourceId) || {};
+      var streams = (ms && ms.MediaStreams) || [];
+      var subs = [];
+      var audios = [];
+      for (var i = 0; i < streams.length; i++) {
+        var s = streams[i] || {};
+        if (s.Type === 'Subtitle' && subtitleCodecSupported(s.Codec) && !junkSubtitleStream(s)) {
+          subs.push(s);
+        } else if (s.Type === 'Audio') {
+          audios.push(s);
+        }
+      }
+      if (!subs.length && !audios.length) {
+        launch();
+        return;
+      }
+      runLaunch = function () {
+        launchPlayerFromSelect(ctl, launch);
+      };
+      pickAudio = function () {
+        if (!audios.length) {
+          runLaunch();
+          return;
+        }
+        var audioItems = [{
+          title: Lampa.Lang.translate('jellyfin_audio_default'),
+          subtitle: externalPlayerSubtitle(),
+          value: -1,
+        }];
+        audios.forEach(function (as) {
+          var at = String(as.DisplayTitle || as.Language || ('Audio ' + (Number(as.Index) + 1)));
+          audioItems.push({ title: at, subtitle: externalPlayerSubtitle(), value: Number(as.Index) });
+        });
+        Lampa.Select.show({
+          title: Lampa.Lang.translate('jellyfin_audio_default'),
+          items: audioItems,
+          onBack: function () { restoreController(ctl); },
+          onSelect: function (sel) {
+            if (!sel) return;
+            try {
+              if (sel.value === -1) currentAudioStreamIndex = null;
+              else currentAudioStreamIndex = sel.value;
+            } catch (e) { }
+            runLaunch();
+          },
+        });
+      };
+      var prefLang = '';
+      try {
+        prefLang = String(Lampa.Storage.get(STORAGE_PREFIX + 'SubLang') || '');
+      } catch (e) { }
+      var subItems = [{
+        title: Lampa.Lang.translate('jellyfin_subs_none'),
+        subtitle: externalPlayerSubtitle(),
+        value: '__none__',
+      }, {
+        title: Lampa.Lang.translate('jellyfin_subs_auto'),
+        subtitle: externalPlayerSubtitle(),
+        value: '__auto__',
+      }];
+      subs.forEach(function (ss) {
+        var st = String(ss.DisplayTitle || ss.Language || 'Subtitle');
+        subItems.push({
+          title: st,
+          subtitle: externalPlayerSubtitle(),
+          value: '__lang__' + String(ss.Language || ''),
+        });
+      });
+      Lampa.Select.show({
+        title: Lampa.Lang.translate('jellyfin_pick_tracks'),
+        items: subItems,
+        onBack: function () { restoreController(ctl); },
+        onSelect: function (sel) {
+          if (!sel) return;
+          var v = String(sel.value || '');
+          try {
+            if (v === '__none__') {
+              Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', '');
+            } else if (v === '__auto__') {
+              Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', '__auto__');
+            } else if (v.indexOf('__lang__') === 0) {
+              Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', v.slice('__lang__'.length));
+            }
+          } catch (e) { }
+          if (audios.length) pickAudio();
+          else runLaunch();
+        },
+      });
+    } catch (e) {
+      if (runLaunch) {
+        runLaunch();
+      } else {
+        try { launchPlayerFromSelect(ctl, launch); } catch (e2) { launch && launch(); }
+      }
+    }
+  }
+
+  function launchExternal(row, allRows, opts, launch) {
+    if (externalTracksEnabled()) {
+      showExternalTracksPicker(row, allRows, opts, launch);
+    } else {
+      launch();
+    }
+  }
+
   function showExternalTranscodeQualityPicker(row, allRows, opts) {
     var ctl = enabledControllerName();
     var items = [
@@ -2503,14 +2646,18 @@
         launchPlayerFromSelect(ctl, function () {
           var po = Object.assign({}, opts || {});
           if (sel.qualityKey === 'auto') {
-            playRow(row, allRows, Object.assign({}, po, { singleStream: true }));
+            launchExternal(row, allRows, po, function () {
+              playRow(row, allRows, Object.assign({}, po, { singleStream: true }));
+            });
             return;
           }
-          playRow(row, allRows, Object.assign({}, po, {
-            singleStream: true,
-            forceTranscode: true,
-            qualityPreset: sel.qualityKey,
-          }));
+          launchExternal(row, allRows, po, function () {
+            playRow(row, allRows, Object.assign({}, po, {
+              singleStream: true,
+              forceTranscode: true,
+              qualityPreset: sel.qualityKey,
+            }));
+          });
         });
       },
     });
@@ -2543,9 +2690,11 @@
             Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
             return;
           }
-          playRow(rowWithVariant(row, variant), allRows, {
-            singleStream: true,
-            qualityTarget: sel.qualityTarget,
+          launchExternal(row, allRows, {}, function () {
+            playRow(rowWithVariant(row, variant), allRows, {
+              singleStream: true,
+              qualityTarget: sel.qualityTarget,
+            });
           });
         });
       },
@@ -2572,7 +2721,9 @@
             variant = findVariantForQuality(ready, targets[0]);
           }
           if (!variant) variant = resolvePlayVariant(ready);
-          playRow(rowWithVariant(ready, variant), allRows, streamOpts);
+          launchExternal(ready, allRows, {}, function () {
+            playRow(rowWithVariant(ready, variant), allRows, streamOpts);
+          });
           return;
         }
         playRow(ready, allRows);
@@ -6048,6 +6199,8 @@
               startAt: Date.now(),
               resumeSec: Math.max(0, Number(ready.resumeSec) || 0),
               durationSec: Math.round((Number(ready.raw.RunTimeTicks) || 0) / 10000000),
+              anchorTime: Math.max(0, Number(ready.resumeSec) || 0),
+              anchorAt: Date.now(),
             };
             cachePlaybackState(externalPlay.rowId, externalPlay.type, 0, externalPlay.resumeSec, externalPlay.durationSec);
             startExternalPlaybackTicker();
@@ -6242,9 +6395,6 @@
         t = Number(state.time) || 0;
         dur = Number(state.duration) || 0;
         pct = Number(state.pct) || 0;
-      } else if (externalPlayFinalSyncDone) {
-        externalPlayFinalSyncDone = false;
-        t = Math.max(0, Math.round((Number(externalPlayFinalTicks) || 0) / 10000000));
       } else {
         return;
       }
@@ -6266,9 +6416,16 @@
 
   function handleRealtimeTime(cur, dur) {
     if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return;
-    if (externalPlay && externalPlay.rowId) return;
     cur = Number(cur) || 0;
     dur = Number(dur) || 0;
+    if (externalPlay && externalPlay.rowId && String(externalPlay.rowId) === String(currentPlayRow.raw.Id)) {
+      anchorExternalPosition(cur);
+      if (dur > 0) externalPlay.durationSec = dur;
+      var pd = externalPlay.durationSec || dur;
+      var pp = pd > 0 ? Math.min(100, Math.max(0, Math.round((cur / pd) * 100))) : 0;
+      reportPlaybackProgress(currentPlayRow, pp, cur, pd, { realtime: true });
+      return;
+    }
     if (dur <= 0 || cur <= 0) return;
     var pct = Math.min(100, Math.max(0, Math.round((cur / dur) * 100)));
     reportPlaybackProgress(currentPlayRow, pct, cur, dur, { realtime: true });
@@ -6300,6 +6457,7 @@
       if (!externalPausedAt) {
         externalPausedAt = Date.now();
         var pstate = externalPlaybackEstimate();
+        if (pstate) anchorExternalPosition(pstate.time);
         if (pstate && currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)) {
           cachePlaybackState(externalPlay.rowId, externalPlay.type, pstate.pct, pstate.time, pstate.duration);
           reportPlaybackProgress(currentPlayRow, pstate.pct, pstate.time, pstate.duration);
@@ -6476,16 +6634,25 @@
 
   function externalElapsedSeconds() {
     if (!externalPlay) return 0;
-    var ms = Date.now() - externalPlay.startAt - externalPausedTotalMs;
+    var anchorAt = externalPlay.anchorAt || externalPlay.startAt;
+    var ms = Date.now() - anchorAt - externalPausedTotalMs;
     if (externalPausedAt) ms -= Date.now() - externalPausedAt;
     return Math.max(0, Math.floor(ms / 1000));
+  }
+
+  function anchorExternalPosition(cur) {
+    if (!externalPlay) return;
+    var c = Math.max(0, Number(cur) || 0);
+    if (!c) return;
+    externalPlay.anchorTime = c;
+    externalPlay.anchorAt = Date.now();
   }
 
   function externalPlaybackEstimate() {
     if (!externalPlay || !externalPlay.rowId) return null;
     var elapsed = externalElapsedSeconds();
     if (elapsed < 10) return null;
-    var t = (externalPlay.resumeSec || 0) + elapsed;
+    var t = (externalPlay.anchorTime || externalPlay.resumeSec || 0) + elapsed;
     var dur = externalPlay.durationSec || 0;
     var pct = dur > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
     return { pct: pct, time: t, duration: dur };
@@ -6495,7 +6662,7 @@
     if (!externalPlay || !externalPlay.rowId) return;
     var elapsed = externalElapsedSeconds();
     if (elapsed < 10) return;
-    var t = (externalPlay.resumeSec || 0) + elapsed;
+    var t = (externalPlay.anchorTime || externalPlay.resumeSec || 0) + elapsed;
     var dur = externalPlay.durationSec || 0;
     var pct = dur > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
     cachePlaybackState(externalPlay.rowId, externalPlay.type, pct, t, dur);
@@ -6515,6 +6682,33 @@
       clearInterval(externalPlayTicker);
     } catch (e) { }
     externalPlayTicker = null;
+  }
+
+  function reAnchorExternalFromPlayer() {
+    try {
+      if (!externalPlay || !externalPlay.rowId) return;
+      var cur = null;
+      try {
+        if (Lampa.Player && typeof Lampa.Player.currentTime === 'function') {
+          cur = Lampa.Player.currentTime();
+        }
+      } catch (e) { }
+      if ((cur === null || cur === undefined || isNaN(Number(cur))) &&
+          Lampa.PlayerVideo && typeof Lampa.PlayerVideo.currentTime === 'function') {
+        try {
+          cur = Lampa.PlayerVideo.currentTime();
+        } catch (e2) { }
+      }
+      var d = Number(cur);
+      if (!isFinite(d) || d <= 0) return;
+      anchorExternalPosition(d);
+      var row = currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)
+        ? currentPlayRow
+        : null;
+      if (row) {
+        reportPlaybackProgress(row, 0, d, externalPlay.durationSec || 0, { realtime: true });
+      }
+    } catch (e) { }
   }
 
   function flushPlaylistProgress() {
@@ -6574,12 +6768,19 @@
 
   function handleVideoSeeked(e) {
     if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return;
-    if (externalPlay && externalPlay.rowId) return;
     var target = e && e.target;
     if (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO') return;
     var dur = Number(target.duration) || 0;
     var t = Number(target.currentTime) || 0;
-    if (!isFinite(dur) || !isFinite(t) || dur <= 0) return;
+    if (!isFinite(dur) || !isFinite(t)) return;
+    if (externalPlay && externalPlay.rowId && String(externalPlay.rowId) === String(currentPlayRow.raw.Id)) {
+      if (dur > 0) externalPlay.durationSec = dur;
+      anchorExternalPosition(t);
+      var pp = dur > 0 ? Math.min(100, Math.max(0, Math.round((t / dur) * 100))) : 0;
+      reportPlaybackProgress(currentPlayRow, pp, t, dur, { realtime: true });
+      return;
+    }
+    if (dur <= 0) return;
     var pct = Math.min(100, Math.max(0, Math.round((t / dur) * 100)));
     cachePlaybackState(
       currentPlayRow.raw.Id,
@@ -6604,23 +6805,40 @@
 
   function handleVideoEnded(e) {
     try {
-      if (externalPlay && externalPlay.rowId) return;
+      var isExt = !!(externalPlay && externalPlay.rowId);
       var target = e && e.target;
-      if (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO') return;
-      var dur = Number(target.duration) || 0;
-      var t = Number(target.currentTime) || 0;
-      if (!isFinite(dur) || !isFinite(t) || dur <= 0) return;
-      var pd = readPlaydata();
-      var id = (pd && (pd.jellyfinId || (pd.item && pd.item.jellyfinId))) || '';
-      if (!id && currentPlayRow && currentPlayRow.raw) id = currentPlayRow.raw.Id;
+      if (!isExt && (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO')) return;
+      var dur = isExt ? (externalPlay.durationSec || 0) : (Number(target.duration) || 0);
+      var t = isExt ? dur : (Number(target.currentTime) || 0);
+      var id = '';
+      var row = null;
+      if (isExt) {
+        id = String(externalPlay.rowId);
+        row = currentPlayRow && String(currentPlayRow.raw.Id) === id ? currentPlayRow : findPlaybackRow(id);
+        if (dur <= 0) {
+          try {
+            var rd = row && row.raw ? runtimeSecondsOf(row) : 0;
+            dur = rd || dur;
+          } catch (e2) { }
+        }
+      } else {
+        var pd = readPlaydata();
+        id = (pd && (pd.jellyfinId || (pd.item && pd.item.jellyfinId))) || '';
+        if (!id && currentPlayRow && currentPlayRow.raw) id = currentPlayRow.raw.Id;
+        if (!id) return;
+        row = findPlaybackRow(id);
+        if (!row || !row.raw) return;
+        if (!isFinite(dur) || !isFinite(t) || dur <= 0) return;
+      }
       if (!id) return;
-      var row = findPlaybackRow(id);
-      if (!row || !row.raw) return;
-      var type = String(row.type || row.raw.Type || '');
+      var type = isExt
+        ? String(externalPlay.type || (row && (row.type || (row.raw && row.raw.Type))) || '')
+        : String(row.type || row.raw.Type || '');
       if (type !== 'Movie' && type !== 'Episode') return;
-      lastCompletedRowId = String(id);
+      lastCompletedRowId = id;
       cachePlaybackState(id, type, 100, t, dur);
-      reportPlaybackProgress(row, 100, t, dur);
+      if (isExt) anchorExternalPosition(dur);
+      if (row && row.raw) reportPlaybackProgress(row, 100, t, dur);
       scheduleHubRefresh();
     } catch (err) { }
   }
@@ -6641,6 +6859,11 @@
     lastCompletedRowId = id;
     cachePlaybackState(id, type, 100, 0, 0);
     reportPlaybackProgress(row, 100, 0, 0);
+    if (externalPlay && String(externalPlay.rowId) === id) {
+      stopExternalPlaybackTicker();
+      externalPlay = null;
+      resetExternalPauseTracking();
+    }
     scheduleHubRefresh();
   }
 
@@ -6653,6 +6876,11 @@
     if (lastCompletedRowId && String(lastCompletedRowId) === id) lastCompletedRowId = null;
     cachePlaybackState(id, type, 0, 0, 0);
     reportPlaybackProgress(row, 0, 0, 0);
+    if (externalPlay && String(externalPlay.rowId) === id) {
+      stopExternalPlaybackTicker();
+      externalPlay = null;
+      resetExternalPauseTracking();
+    }
     lastProgressResetRowId = id;
     if (lastProgressResetTimer) clearTimeout(lastProgressResetTimer);
     lastProgressResetTimer = setTimeout(function () {
@@ -10902,6 +11130,15 @@
         },
       });
 
+      Lampa.SettingsApi.addParam({
+        component: target,
+        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'ExternalTracks' },
+        field: { name: Lampa.Lang.translate('jellyfin_set_ext_tracks') },
+        onChange: function () {
+          Lampa.Settings.update();
+        },
+      });
+
       if (exists) {
         Lampa.SettingsApi.addParam({
           component: parentComponent,
@@ -13365,6 +13602,8 @@
               externalPlay.type = String(readyRow.type || readyRow.raw.Type || '');
               externalPlay.resumeSec = Math.max(0, Number(readyRow.resumeSec) || 0);
               externalPlay.durationSec = Math.round((Number(readyRow.raw.RunTimeTicks) || 0) / 10000000);
+              externalPlay.anchorTime = Math.max(0, Number(readyRow.resumeSec) || 0);
+              externalPlay.anchorAt = Date.now();
             }
             externalPlay.startAt = Date.now();
             resetExternalPauseTracking();
@@ -13453,7 +13692,7 @@
           } else if (document.visibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
               syncFlushPlaybackProgress(true);
-              externalPlayFinalSyncDone = false;
+              reAnchorExternalFromPlayer();
               startExternalPlaybackTicker();
             }
           }
@@ -13464,7 +13703,7 @@
           } else if (document.webkitVisibilityState === 'visible') {
             if (externalPlay && externalPlay.rowId) {
               syncFlushPlaybackProgress(true);
-              externalPlayFinalSyncDone = false;
+              reAnchorExternalFromPlayer();
               startExternalPlaybackTicker();
             }
           }
