@@ -6086,8 +6086,8 @@
       return false;
     }
     var payload = JSON.stringify(body);
-    if (postJfSync(url, payload, path)) return true;
-    return postJfBeacon(url, payload);
+    if (postJfBeacon(url, payload)) return true;
+    return postJfSync(url, payload, path);
   }
 
   function syncPostJfUnload(path, body) {
@@ -6962,6 +6962,7 @@
       return html;
     };
     this.destroy = function () {
+      loading = false;
       Lampa.Listener.remove('jellyfin:row-updated', onRowUpdated);
       playlistFocusedRow = null;
       playlistRingFocused = false;
@@ -9373,7 +9374,7 @@
         .html(head.join(', '));
       var info = [];
       if (runtime) info.push('<span>' + runtime + '</span>');
-      if (genres) info.push('<span>' + genres + '</span>');
+      if (genres) info.push('<span>' + $('<span>').text(genres).html() + '</span>');
       $start.find('.full-start-new__details').html(
         info.join('<span class="full-start-new__split">·</span>')
       );
@@ -9559,6 +9560,7 @@
       return html;
     };
     this.destroy = function () {
+      loading = false;
       Lampa.Listener.remove('jellyfin:row-updated', onRowUpdated);
       cardsById = {};
       scroll.destroy();
@@ -9966,6 +9968,7 @@
       return html;
     };
     this.destroy = function () {
+      loading = false;
       Lampa.Listener.remove('jellyfin:row-updated', onRowUpdated);
       cardsById = {};
       scroll.destroy();
@@ -11166,7 +11169,7 @@
       var profileUrl = 'https://github.com/pavelpikta';
       var modal = $(
         '<div class="jellyfin-about">' +
-          '<div class="jellyfin-about__brand">' +
+          '<div class="jellyfin-about__brand selector">' +
           '<span class="jellyfin-about__icon">' + MANIFEST.icon + '</span>' +
           '<span class="jellyfin-about__name"></span>' +
           '</div>' +
@@ -11241,12 +11244,16 @@
       addLabel(Lampa.Lang.translate('jellyfin_about_version'), MANIFEST.version);
       addLabel(Lampa.Lang.translate('jellyfin_about_author'), MANIFEST.author);
 
+      var aboutCtl = enabledControllerName('settings');
+      var aboutBrand = modal.find('.jellyfin-about__brand')[0] || null;
       Lampa.Modal.open({
         title: Lampa.Lang.translate('jellyfin_about'),
         html: modal,
         size: 'large',
+        select: aboutBrand,
         onBack: function () {
           if (typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+          restoreController(aboutCtl);
         },
       });
     } catch (e) { }
