@@ -23,7 +23,8 @@
   var DETAIL_COMPONENT = STORAGE_PREFIX + 'Detail';
   var AUDIO_PLAYER_COMPONENT = STORAGE_PREFIX + 'AudioPlayer';
   var EPISODES_COMPONENT = STORAGE_PREFIX + 'Episodes';
-  var HUB_PREVIEW_LIMIT = 12;
+  var HUB_PREVIEW_LIMIT = 16;
+  var HUB_NEXTUP_LIMIT = 18;
 
   var DEFAULT_URL = '';
   var DEFAULT_API_KEY = '';
@@ -94,7 +95,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 13',
+    version: '2.0.0 Beta 15',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description:
@@ -2615,12 +2616,24 @@
       .trim();
   }
 
+  function parseSEFromName(name) {
+    var m = String(name || '').match(/\bs?(\d{1,2})\s*[ex]\s*(\d{1,4})\b/i);
+    if (!m) return null;
+    return { season: Number(m[1]), episode: Number(m[2]) };
+  }
+
   function episodeNumbers(item) {
     item = item || {};
-    return {
-      season: Number(item.ParentIndexNumber) || 0,
-      episode: Number(item.IndexNumber) || 0,
-    };
+    var season = Number(item.ParentIndexNumber) || 0;
+    var episode = Number(item.IndexNumber) || 0;
+    if ((!episode || !season) && (item.Type === 'Episode' || item.SeriesId)) {
+      var se = parseSEFromName(item.Name || item.SortName);
+      if (se) {
+        if (!season) season = se.season;
+        if (!episode) episode = se.episode;
+      }
+    }
+    return { season: season, episode: episode };
   }
 
   function episodeCode(item) {
@@ -2873,14 +2886,32 @@
     return out;
   }
 
+  function latestRowSortName(row) {
+    if (!row || !row.raw) return '';
+    return String(
+      row.raw.SortName ||
+      row.raw.Name ||
+      row.title ||
+      ''
+    ).toLowerCase();
+  }
+
   function sortLatestRows(rows) {
     return rows.slice().sort(function (a, b) {
       var da = a && a.raw ? String(a.raw.DateCreated || '') : '';
       var db = b && b.raw ? String(b.raw.DateCreated || '') : '';
-      if (!da && !db) return 0;
+      if (!da && !db) {
+        return String(latestRowSortName(a)).localeCompare(
+          String(latestRowSortName(b)), undefined, { numeric: true }
+        );
+      }
       if (!da) return 1;
       if (!db) return -1;
-      if (da === db) return 0;
+      if (da === db) {
+        return String(latestRowSortName(a)).localeCompare(
+          String(latestRowSortName(b)), undefined, { numeric: true }
+        );
+      }
       return da > db ? -1 : 1;
     });
   }
@@ -2922,6 +2953,30 @@
     );
   }
 
+  function dedupeEpisodeRowsOrdered(rows) {
+    var best = {};
+    var order = [];
+    rows.forEach(function (row) {
+      var raw = row.raw || {};
+      var idx = Number(raw.IndexNumber) || 0;
+      var key =
+        String(raw.SeriesId || '') +
+        '/' +
+        String(raw.ParentIndexNumber || 0) +
+        '/' +
+        (idx > 0 ? String(idx) : 'id:' + String(row.id || raw.Id || ''));
+      if (best[key]) {
+        best[key] = mergeTmdbRows(best[key], row);
+      } else {
+        best[key] = row;
+        order.push(key);
+      }
+    });
+    return order.map(function (k) {
+      return best[k];
+    });
+  }
+
   function processRows(items, category) {
     var rows = items.map(function (item) {
       return mapRow(item);
@@ -2930,6 +2985,24 @@
       rows = dedupeEpisodeRows(rows);
       return enrichRowsFromTmdb(rows).then(function (enriched) {
         return dedupeEpisodeRows(enriched);
+      });
+    }
+    if (category === 'NextUp') {
+      rows = dedupeEpisodeRowsOrdered(rows);
+      return enrichRowsFromTmdb(rows).then(function (enriched) {
+        return dedupeEpisodeRowsOrdered(enriched);
+      });
+    }
+    if (category === 'LatestApi') {
+      return enrichRowsFromTmdb(rows).then(function (enriched) {
+        return filterRows(enriched, 'Latest').map(function (row) {
+          return episodeSeriesDisplayRow(row);
+        });
+      });
+    }
+    if (category === 'Resume') {
+      return enrichRowsFromTmdb(rows).then(function (enriched) {
+        return filterRows(enriched, 'Resume');
       });
     }
     if (storageToggle('Dedupe', true)) rows = dedupeRows(rows);
@@ -2991,14 +3064,14 @@
 
   function latestItemsPath(userId, parentId, includeTypes, limit) {
     var fields =
-      'ProviderIds,ImageTags,ProductionYear,SeriesName,ParentIndexNumber,IndexNumber,UserData,SeriesId,SeriesPrimaryImageTag,CommunityRating,RunTimeTicks,MediaSourceCount,MediaSources,ParentId,Album,DateCreated';
+      'ProviderIds,ImageTags,ProductionYear,SeriesName,ParentIndexNumber,IndexNumber,UserData,SeriesId,SeriesPrimaryImageTag,CommunityRating,RunTimeTicks,MediaSourceCount,MediaSources,ParentId,Album,DateCreated,SortName';
     return (
       '/Items?UserId=' +
       encodeURIComponent(userId) +
       (parentId ? '&ParentId=' + encodeURIComponent(parentId) : '') +
       '&IncludeItemTypes=' +
       encodeURIComponent(includeTypes) +
-      '&Recursive=true&SortBy=DateCreated&SortOrder=Descending&Limit=' +
+      '&Recursive=true&SortBy=DateCreated,SortName&SortOrder=Descending&Limit=' +
       (limit || PAGE_SIZE) +
       '&Fields=' +
       encodeURIComponent(fields) +
@@ -3024,20 +3097,25 @@
     });
   }
 
-  function fetchNextUp(userId) {
+  function fetchNextUp(userId, startIndex) {
+    startIndex = startIndex || 0;
     return jfHttp(
       '/Shows/NextUp?UserId=' +
       encodeURIComponent(userId) +
       '&' +
-      latestFieldsQuery()
+      latestFieldsQuery(PAGE_SIZE) +
+      '&StartIndex=' +
+      startIndex +
+      '&EnableTotalRecordCount=true'
     ).then(function (data) {
       var items = (data && data.Items) || [];
-      return processRows(items, 'Episode').then(function (rows) {
+      var total = data && typeof data.TotalRecordCount === 'number' ? data.TotalRecordCount : startIndex + items.length;
+      return processRows(items, 'NextUp').then(function (rows) {
         return {
           rows: rows,
-          total: (data && data.TotalRecordCount) || rows.length,
-          next: items.length,
-          hasMore: false,
+          total: total,
+          next: startIndex + items.length,
+          hasMore: startIndex + items.length < total,
         };
       });
     });
@@ -3076,13 +3154,29 @@
     });
   }
 
+  function latestApiPath(userId, parentId, limit) {
+    var fields =
+      'ProviderIds,ImageTags,ProductionYear,SeriesName,ParentIndexNumber,IndexNumber,UserData,SeriesId,SeriesPrimaryImageTag,CommunityRating,RunTimeTicks,MediaSourceCount,MediaSources,Path,ParentId,Album,DateCreated';
+    return (
+      '/Users/' +
+      encodeURIComponent(userId) +
+      '/Items/Latest?' +
+      (parentId ? 'ParentId=' + encodeURIComponent(parentId) + '&' : '') +
+      'Limit=' +
+      (limit || PAGE_SIZE) +
+      '&Fields=' +
+      encodeURIComponent(fields) +
+      '&imageTypeLimit=1&EnableImageTypes=Primary&EnableUserData=true'
+    );
+  }
+
   function fetchLibraryLatest(library) {
     return resolveUserId().then(function (userId) {
       return jfHttp(
-        latestItemsPath(userId, library.Id, latestIncludeTypes(library), HUB_PREVIEW_LIMIT)
+        latestApiPath(userId, library.Id, HUB_PREVIEW_LIMIT)
       ).then(function (data) {
-        var items = (data && data.Items) || [];
-        return processRows(items, 'Latest').then(function (rows) {
+        var items = data && data.Items ? data.Items : Array.isArray(data) ? data : [];
+        return processRows(items, 'LatestApi').then(function (rows) {
           return attachSeriesQualities(rows).then(function (rowsWithQuality) {
             return { library: library, rows: rowsWithQuality };
           });
@@ -3104,7 +3198,7 @@
   function fetchItems(category, startIndex) {
     return resolveUserId().then(function (userId) {
       if (category === 'Latest') return fetchLatest(userId);
-      if (category === 'NextUp') return fetchNextUp(userId);
+      if (category === 'NextUp') return fetchNextUp(userId, startIndex);
       if (category === 'Movie' && !libraryCategoryEnabled('movies')) {
         return { rows: [], total: 0, next: 0, hasMore: false };
       }
@@ -3134,11 +3228,22 @@
     });
   }
 
+  function hubLimitFor(category) {
+    return category === 'NextUp' ? HUB_NEXTUP_LIMIT : HUB_PREVIEW_LIMIT;
+  }
+
   function hubSection(result, category) {
-    var rows = (result && result.rows) || [];
+    var srcRows = (result && result.rows) || [];
+    if (category === 'NextUp') {
+      srcRows = srcRows.filter(function (row) {
+        var ud = row && row.raw ? row.raw.UserData : null;
+        return !ud || !(Number(ud.PlaybackPositionTicks) > 0);
+      });
+    }
+    var rows = srcRows.slice(0, hubLimitFor(category));
     return {
       category: category,
-      rows: rows.slice(0, HUB_PREVIEW_LIMIT),
+      rows: rows,
       total: (result && result.total) || rows.length,
       previewPosters: rows
         .slice(0, 3)
@@ -4019,7 +4124,7 @@
       });
       if (!results.length) return;
 
-      var more = spec.more !== undefined ? spec.more : spec.total > spec.rows.length;
+      var more = spec.more === false ? false : spec.total >= hubLimitFor(spec.category);
       lines.push({
         title: spec.title,
         category: spec.category,
@@ -4050,11 +4155,12 @@
         category: 'NextUp',
         rows: data.nextup.rows,
         total: data.nextup.total,
+        more: true,
       });
     }
 
     (data.libraryLatest || []).forEach(function (section) {
-      if (!section.rows.length) return;
+      if (!section.rows || !section.rows.length) return;
       var library = section.library;
       pushSection({
         key: 'lib-' + library.Id,
@@ -4105,7 +4211,7 @@
     if (data.resume.rows.length || data.nextup.rows.length) return true;
     var libs = data.libraryLatest || [];
     for (var i = 0; i < libs.length; i++) {
-      if (libs[i].rows.length) return true;
+      if (libs[i].rows && libs[i].rows.length) return true;
     }
     return false;
   }
@@ -4519,7 +4625,6 @@
           var seriesLine = data.category === 'NextUp' || data.category === 'Resume';
           $render = makeJellyfinCard(row, {
             tapToPlay: hubCtx.tapToPlay,
-            playOnEnter: seriesLine,
             seriesDisplay: seriesLine,
             homeMedia: data.homeMedia,
             cardsById: hubCtx.cardsById,
@@ -9794,7 +9899,6 @@
       return {
         owner: self,
         tapToPlay: tapToPlay,
-        playOnEnter: seriesLine,
         seriesDisplay: seriesLine,
         homeMedia: homeMedia,
         musicMedia: musicMedia,
@@ -10653,7 +10757,7 @@
       '.jellyfin-about__heading{font-size:.9em;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:rgba(255,255,255,.55);margin:0 0 .8em}' +
       '.jellyfin-about__descr{font-size:1.2em;line-height:1.8}' +
       '.jellyfin-about__thanks{font-size:1.15em;line-height:1.8}' +
-      '.jellyfin-about__link{color:#4aa8e0;text-decoration:underline;cursor:pointer}' +
+      'a.jellyfin-about__link{color:inherit;text-decoration:none;font-weight:700;cursor:pointer}' +
       '.jellyfin-about__link.focus{outline:none;background:rgba(255,255,255,.12);border-radius:.3em;padding:.05em .25em;margin:0 -.25em}' +
       '</style>'
     );
@@ -11186,6 +11290,13 @@
       );
       modal.find('.jellyfin-about__name').text(MANIFEST.name);
 
+      var ctl = enabledControllerName();
+      var $aboutBrand = modal.find('.jellyfin-about__brand').addClass('selector');
+      $aboutBrand.on('hover:enter', function () {
+        if (typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+        restoreController(ctl);
+      });
+
       var sections = modal.find('.jellyfin-about__section');
       sections
         .eq(0)
@@ -11245,8 +11356,10 @@
         title: Lampa.Lang.translate('jellyfin_about'),
         html: modal,
         size: 'large',
+        select: $aboutBrand[0],
         onBack: function () {
           if (typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+          restoreController(ctl);
         },
       });
     } catch (e) { }
