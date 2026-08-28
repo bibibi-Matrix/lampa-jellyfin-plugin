@@ -11,6 +11,12 @@
   var API_COMPONENT = STORAGE_PREFIX + 'Api';
   var HLS_COMPONENT = STORAGE_PREFIX + 'Hls';
   var BUTTONS_COMPONENT = STORAGE_PREFIX + 'Buttons';
+  var CATALOG_COMPONENT = STORAGE_PREFIX + 'Catalog';
+  var PLAYBACK_COMPONENT = STORAGE_PREFIX + 'Playback';
+  var SYNC_COMPONENT = STORAGE_PREFIX + 'Sync';
+  var TRANSCODE_COMPONENT = STORAGE_PREFIX + 'Transcode';
+  var AUDIO_COMPONENT = STORAGE_PREFIX + 'Audio';
+  var QUALITY_COMPONENT = STORAGE_PREFIX + 'Quality';
   var PANEL_COMPONENT = STORAGE_PREFIX + 'Panel';
   var HUB_COMPONENT = STORAGE_PREFIX + 'Hub';
   var PHOTO_VIEWER_COMPONENT = STORAGE_PREFIX + 'PhotoViewer';
@@ -28,8 +34,12 @@
   var PAGE_SIZE = 48;
   var IMG_PLACEHOLDER = './img/img_load.svg';
   var RT_UI_TICK_MS = 250;
-  var RT_TIMELINE_MS = 10000;
+  var RT_TIMELINE_MS = 3000;
   var RT_NET_INTERVAL_MS = 2000;
+  var TMDB_MIRROR_INTERVAL_MS = 3000;
+  var TMDB_SESSION_INTERVAL_MS = 3000;
+  var TMDB_GUARD_RETAIN_MS = 15000;
+  var TMDB_PUSH_DEDUP_MS = 60000;
   var EXTERNAL_TICKER_MS = 250;
   var API_CACHE_TTL_MS = 30 * 60 * 1000;
   var API_USERDATA_TTL_MS = 3 * 60 * 1000;
@@ -84,7 +94,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 12',
+    version: '2.0.0 Beta 13',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description: 'Browse and play your Jellyfin library in Lampa',
@@ -104,6 +114,8 @@
 
   var $headIconEl = null;
   var $menuBtnEl = null;
+  var jellyfinUrlConnState = 'check';
+  var jellyfinConnCheckBusy = false;
 
   var cachedUserId = '';
   var cachedAutoUserName = '';
@@ -214,8 +226,10 @@
       jellyfin_auth_ok: { en: 'Connection OK', ru: 'Подключение успешно' },
       jellyfin_auth_fail: { en: 'Connection failed', ru: 'Не удалось подключиться' },
       jellyfin_test: { en: 'Test connection', ru: 'Проверить подключение' },
-      jellyfin_url: { en: 'Server URL', ru: 'URL сервера' },
+      jellyfin_url: { en: 'Server address', ru: 'Адрес сервера' },
       jellyfin_key: { en: 'API key', ru: 'API-ключ' },
+      jellyfin_delete: { en: 'Delete', ru: 'Удалить' },
+      jellyfin_reset: { en: 'Reset', ru: 'Сбросить' },
       jellyfin_no_tmdb: {
         en: 'No TMDB id on this item',
         ru: 'Нет TMDB id у этого элемента',
@@ -230,6 +244,10 @@
         en: 'Jellyfin URL and API key from Dashboard → API Keys',
         ru: 'URL Jellyfin и API-ключ из Панель → Ключи API',
       },
+      jellyfin_conn: { en: 'Connection', ru: 'Подключение' },
+      jellyfin_conn_ok: { en: 'Connected', ru: 'Подключено' },
+      jellyfin_conn_fail: { en: 'No connection', ru: 'Нет подключения' },
+      jellyfin_conn_checking: { en: 'Checking…', ru: 'Проверка…' },
       jellyfin_set_dedupe: {
         en: 'Merge duplicates (TMDB)',
         ru: 'Объединять дубликаты (TMDB)',
@@ -285,8 +303,8 @@
         ru: 'Категории медиатеки',
       },
       jellyfin_set_api_hint: {
-        en: 'Server address and API key are taken from Jellyfin Dashboard → Advanced → API Keys. The plugin uses the same key for all users.',
-        ru: 'Адрес сервера и API-ключ берутся из Jellyfin: Панель → Дополнительно → Ключи API. Один ключ используется для всех пользователей.',
+        en: 'API key is taken from Jellyfin Dashboard → Advanced → API Keys. The plugin uses the same key for all users.',
+        ru: 'API-ключ берётся из Jellyfin: Панель → Дополнительно → Ключи API. Один ключ используется для всех пользователей.',
       },
       jellyfin_set_api_btn: {
         en: 'Server and user',
@@ -299,6 +317,30 @@
       jellyfin_set_buttons_btn: {
         en: 'Buttons display',
         ru: 'Отображение кнопок',
+      },
+      jellyfin_set_catalog_group: {
+        en: 'Catalogue',
+        ru: 'Каталог',
+      },
+      jellyfin_set_playback_group: {
+        en: 'Playback',
+        ru: 'Воспроизведение',
+      },
+      jellyfin_set_sync_group: {
+        en: 'Synchronization',
+        ru: 'Синхронизация',
+      },
+      jellyfin_set_transcoding_group: {
+        en: 'Transcoding',
+        ru: 'Транскодинг',
+      },
+      jellyfin_set_audio_group: {
+        en: 'Audio',
+        ru: 'Аудио',
+      },
+      jellyfin_set_quality_group: {
+        en: 'Quality',
+        ru: 'Качество',
       },
       jellyfin_set_head_btn: {
         en: 'Show Jellyfin button in the top panel',
@@ -376,7 +418,7 @@
       var v =
         String(Lampa.Storage.get(STORAGE_PREFIX + suffix) || '').trim() ||
         String(Lampa.Storage.field(STORAGE_PREFIX + suffix) || '').trim();
-      if (v) return v;
+      if (v && v !== 'undefined') return v;
     } catch (e) { }
     return fallback == null ? '' : String(fallback);
   }
@@ -398,10 +440,20 @@
   }
 
   function apiBase() {
+    var raw = null;
+    try {
+      raw = Lampa.Storage.get(STORAGE_PREFIX + 'Url');
+    } catch (e) { }
+    if (raw !== null && raw !== undefined && String(raw).trim() === '') return '';
     return normalizeBase(storageStr('Url', DEFAULT_URL));
   }
 
   function apiKey() {
+    var raw = null;
+    try {
+      raw = Lampa.Storage.get(STORAGE_PREFIX + 'Key');
+    } catch (e) { }
+    if (raw !== null && raw !== undefined && String(raw).trim() === '') return '';
     return storageStr('Key', DEFAULT_API_KEY);
   }
 
@@ -696,18 +748,18 @@
     var label = storedUserLabel();
     if (label) return label;
     if (cachedAutoUserName) return cachedAutoUserName;
-    return Lampa.Lang.translate('jellyfin_user_auto');
+    return String(Lampa.Lang.translate('jellyfin_user_auto') || '');
   }
 
   function autoUserPickTitle(users) {
     var user = defaultUserFromList(users);
-    var title = Lampa.Lang.translate('jellyfin_user_auto');
-    if (user && user.Name) title += ' — ' + user.Name;
+    var title = String(Lampa.Lang.translate('jellyfin_user_auto') || '');
+    if (user && user.Name) title += ' — ' + String(user.Name);
     return title;
   }
 
   function syncUserInfoField() {
-    var $descr = $('[data-name="' + STORAGE_PREFIX + 'UserInfo"] .settings-param__descr');
+    var $descr = $('[data-name="' + STORAGE_PREFIX + 'PickUser"] .settings-param__descr');
     if ($descr.length) $descr.text(currentUserLabel());
   }
 
@@ -716,7 +768,7 @@
     fetchUsers()
       .then(function (users) {
         var items = users.map(function (user) {
-          return { title: user.Name || user.Id, userId: String(user.Id || '') };
+          return { title: String(user.Name || user.Id || ''), userId: String(user.Id || '') };
         });
         rememberAutoUser(defaultUserFromList(users));
         items.unshift({
@@ -10206,6 +10258,20 @@
     Lampa.Template.add(
       'jellyfin_style',
       '<style>' +
+      '.jellyfin-conn-dot{display:inline-block;width:.85em;height:.85em;border-radius:50%;flex:0 0 auto;background:#888}' +
+      '.jellyfin-conn-dot--ok{background:#2ee86d;box-shadow:0 0 .6em rgba(46,232,109,.7)}' +
+      '.jellyfin-conn-dot--bad{background:#ff5252;box-shadow:0 0 .6em rgba(255,82,82,.7)}' +
+      '.jellyfin-conn-dot--check{background:#ffb83d;box-shadow:0 0 .6em rgba(255,184,61,.7)}' +
+      '.jellyfin-conn-dot--idle{background:#8a8a8a}' +
+      '.settings-input .simple-keyboard-buttons__del,.settings-input .simple-keyboard-buttons__reset{padding:.7em;font-size:1.2em;border-radius:.3em;cursor:pointer;color:#fff;background:rgba(255,255,255,.12)}' +
+      '.settings-input .simple-keyboard-buttons__del:hover,.settings-input .simple-keyboard-buttons__reset:hover{background-color:#fff;color:#000}' +
+      '.jellyfin-url-field{display:flex;align-items:center;gap:.6em;flex-wrap:wrap}' +
+      '.jellyfin-url-status__dot{cursor:pointer;width:.8em;height:.8em;flex:0 0 auto}' +
+      '.jellyfin-conn-label{font-weight:700;font-size:1.02em;line-height:1.3}' +
+      '.jellyfin-conn-label--ok{color:#2ee86d}' +
+      '.jellyfin-conn-label--bad{color:#ff5252}' +
+      '.jellyfin-conn-label--check{color:#ffb83d}' +
+      '.jellyfin-conn-path{width:100%;font-size:.85em;opacity:.6;word-break:break-all}' +
       '.jellyfin-hub .items-line--jf-stats{min-height:0!important;padding-bottom:1em}' +
       '.jellyfin-hub .items-line{padding-bottom:1em}' +
       '.jellyfin-hub .items-line--type-cards{min-height:0}' +
@@ -10556,6 +10622,71 @@
     );
   }
 
+  function patchUrlInputEdit() {
+    if (!Lampa.Input || typeof Lampa.Input.edit !== 'function') return;
+    if (Lampa.Input.edit.__jellyfinUrlInputPatched) return;
+    Lampa.Input.edit.__jellyfinUrlInputPatched = true;
+
+    var fieldDefaults = {};
+    fieldDefaults[STORAGE_PREFIX + 'Url'] = DEFAULT_URL;
+    fieldDefaults[STORAGE_PREFIX + 'Key'] = DEFAULT_API_KEY;
+
+    var origEdit = Lampa.Input.edit;
+
+    Lampa.Input.edit = function (params, call) {
+      if (!params || !Object.prototype.hasOwnProperty.call(fieldDefaults, String(params.name || ''))) {
+        return origEdit(params, call);
+      }
+
+      var saveAllowed = true;
+      var wrappedCall = function (value) {
+        if (!saveAllowed) {
+          saveAllowed = true;
+          return;
+        }
+        if (typeof call === 'function') call(value);
+      };
+
+      var kb;
+      try {
+        kb = origEdit(params, wrappedCall);
+      } catch (e) {
+        return origEdit(params, call);
+      }
+      if (!kb) return kb;
+
+      var $buttons = $('.settings-input').last().find('.simple-keyboard-buttons');
+      var $cancel = $buttons.find('.simple-keyboard-buttons__cancel');
+      if (!$cancel.length) return kb;
+
+      var name = String(params.name || '');
+
+      var $del = $('<div class="simple-keyboard-buttons__del">' +
+        String(Lampa.Lang.translate('jellyfin_delete') || 'Удалить') + '</div>');
+      $del.on('click', function () {
+        kb.value('');
+        if (kb.listener) kb.listener.send('enter');
+      });
+
+      var $reset = $('<div class="simple-keyboard-buttons__reset">' +
+        String(Lampa.Lang.translate('jellyfin_reset') || 'Сбросить') + '</div>');
+      $reset.on('click', function () {
+        kb.value(fieldDefaults[name]);
+        if (kb.listener) kb.listener.send('enter');
+      });
+
+      $cancel.off('click').on('click', function () {
+        saveAllowed = false;
+        if (Lampa.Controller) Lampa.Controller.back();
+      });
+
+      $del.insertBefore($cancel);
+      $reset.insertBefore($cancel);
+
+      return kb;
+    };
+  }
+
   function addSettings() {
     Lampa.SettingsApi.addComponent({
       component: SETTINGS_COMPONENT,
@@ -10567,12 +10698,17 @@
     addDisplaySettings();
     addCategoriesSettings();
     addHlsSettings();
+    patchUrlInputEdit();
   }
 
   function addHlsSettings() {
-    function registerHlsParams(component) {
+    function registerTranscodingParams(parentComponent) {
+      var exists = typeof Lampa.Settings.create === 'function';
+      var target = exists ? TRANSCODE_COMPONENT : parentComponent;
+      if (exists) Lampa.Template.add('settings_' + TRANSCODE_COMPONENT, '<div></div>');
+
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'Transcode' },
         field: { name: Lampa.Lang.translate('jellyfin_set_transcode') },
         onChange: function () {
@@ -10581,13 +10717,13 @@
       });
 
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: { name: STORAGE_PREFIX + 'StreamHint', type: 'static' },
         field: { name: Lampa.Lang.translate('jellyfin_set_stream_hint') },
       });
 
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: {
           name: STORAGE_PREFIX + 'TranscodeFormat',
           type: 'select',
@@ -10605,8 +10741,29 @@
         },
       });
 
+      if (exists) {
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'TranscodeGroup' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_transcoding_group') },
+          onChange: function () {
+            Lampa.Settings.create(TRANSCODE_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+      }
+    }
+
+    function registerAudioParams(parentComponent) {
+      var exists = typeof Lampa.Settings.create === 'function';
+      var target = exists ? AUDIO_COMPONENT : parentComponent;
+      if (exists) Lampa.Template.add('settings_' + AUDIO_COMPONENT, '<div></div>');
+
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: {
           name: STORAGE_PREFIX + 'MaxAudioChannels',
           type: 'select',
@@ -10623,7 +10780,7 @@
       });
 
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'TracksSubs' },
         field: { name: Lampa.Lang.translate('jellyfin_set_tracks_subs') },
         onChange: function () {
@@ -10631,8 +10788,29 @@
         },
       });
 
+      if (exists) {
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'AudioGroup' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_audio_group') },
+          onChange: function () {
+            Lampa.Settings.create(AUDIO_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+      }
+    }
+
+    function registerQualityParams(parentComponent) {
+      var exists = typeof Lampa.Settings.create === 'function';
+      var target = exists ? QUALITY_COMPONENT : parentComponent;
+      if (exists) Lampa.Template.add('settings_' + QUALITY_COMPONENT, '<div></div>');
+
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'ExternalQuality' },
         field: { name: Lampa.Lang.translate('jellyfin_set_ext_quality') },
         onChange: function () {
@@ -10641,10 +10819,31 @@
       });
 
       Lampa.SettingsApi.addParam({
-        component: component,
+        component: target,
         param: { name: STORAGE_PREFIX + 'ExtQualityHint', type: 'static' },
         field: { name: Lampa.Lang.translate('jellyfin_set_ext_quality_hint') },
       });
+
+      if (exists) {
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'QualityGroup' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_quality_group') },
+          onChange: function () {
+            Lampa.Settings.create(QUALITY_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+      }
+    }
+
+    function registerHlsParams(component) {
+      registerTranscodingParams(component);
+      registerAudioParams(component);
+      registerQualityParams(component);
     }
 
     if (typeof Lampa.Settings.create === 'function') {
@@ -10702,6 +10901,111 @@
       });
     }
 
+    function addToggle(component, name, labelKey, defaultValue, onChange) {
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'trigger', default: defaultValue !== undefined ? defaultValue : true, name: name },
+        field: { name: Lampa.Lang.translate(labelKey) },
+        onChange: onChange || function () {
+          Lampa.Settings.update();
+        },
+      });
+    }
+
+    function registerCatalogParams(parentComponent) {
+      if (typeof Lampa.Settings.create === 'function') {
+        Lampa.Template.add('settings_' + CATALOG_COMPONENT, '<div></div>');
+
+        addToggle(CATALOG_COMPONENT, STORAGE_PREFIX + 'Dedupe', 'jellyfin_set_dedupe');
+        addToggle(CATALOG_COMPONENT, STORAGE_PREFIX + 'HideFolders', 'jellyfin_set_hide_folders');
+        addToggle(CATALOG_COMPONENT, STORAGE_PREFIX + 'TmdbPosters', 'jellyfin_set_tmdb_posters', true, function () {
+          clearTmdbMetaCache();
+          Lampa.Settings.update();
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'Catalog' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_catalog_group') },
+          onChange: function () {
+            Lampa.Settings.create(CATALOG_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+        return;
+      }
+
+      addToggle(parentComponent, STORAGE_PREFIX + 'Dedupe', 'jellyfin_set_dedupe');
+      addToggle(parentComponent, STORAGE_PREFIX + 'HideFolders', 'jellyfin_set_hide_folders');
+      addToggle(parentComponent, STORAGE_PREFIX + 'TmdbPosters', 'jellyfin_set_tmdb_posters', true, function () {
+        clearTmdbMetaCache();
+        Lampa.Settings.update();
+      });
+    }
+
+    function registerPlaybackParams(parentComponent) {
+      if (typeof Lampa.Settings.create === 'function') {
+        Lampa.Template.add('settings_' + PLAYBACK_COMPONENT, '<div></div>');
+
+        addToggle(PLAYBACK_COMPONENT, STORAGE_PREFIX + 'TapPlay', 'jellyfin_set_tap_play', false);
+
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'Playback' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_playback_group') },
+          onChange: function () {
+            Lampa.Settings.create(PLAYBACK_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+        return;
+      }
+
+      addToggle(parentComponent, STORAGE_PREFIX + 'TapPlay', 'jellyfin_set_tap_play', false);
+    }
+
+    function registerSyncParams(parentComponent) {
+      if (typeof Lampa.Settings.create === 'function') {
+        Lampa.Template.add('settings_' + SYNC_COMPONENT, '<div></div>');
+
+        Lampa.SettingsApi.addParam({
+          component: SYNC_COMPONENT,
+          param: { name: STORAGE_PREFIX + 'SyncHint', type: 'static' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_sync_watched_hint') },
+        });
+
+        addToggle(SYNC_COMPONENT, STORAGE_PREFIX + 'SyncWatched', 'jellyfin_set_sync_watched', true, function () {
+          Lampa.Settings.update();
+          scheduleTmdbSyncFromLibrary();
+        });
+
+        Lampa.SettingsApi.addParam({
+          component: parentComponent,
+          param: { type: 'button', name: STORAGE_PREFIX + 'Sync' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_sync_group') },
+          onChange: function () {
+            Lampa.Settings.create(SYNC_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(parentComponent);
+              },
+            });
+          },
+        });
+        return;
+      }
+
+      addToggle(parentComponent, STORAGE_PREFIX + 'SyncWatched', 'jellyfin_set_sync_watched', true, function () {
+        Lampa.Settings.update();
+        scheduleTmdbSyncFromLibrary();
+      });
+    }
+
     function registerDisplayParams(component) {
       if (typeof Lampa.Settings.create === 'function') {
         Lampa.Template.add('settings_' + BUTTONS_COMPONENT, '<div></div>');
@@ -10720,56 +11024,26 @@
             });
           },
         });
+
+        Lampa.SettingsApi.addParam({
+          component: component,
+          param: { type: 'button', name: STORAGE_PREFIX + 'Categories' },
+          field: { name: Lampa.Lang.translate('jellyfin_set_categories_btn') },
+          onChange: function () {
+            Lampa.Settings.create(CATEGORIES_COMPONENT, {
+              onBack: function () {
+                Lampa.Settings.create(component);
+              },
+            });
+          },
+        });
       } else {
         registerButtonsParams(component);
       }
 
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'Dedupe' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_dedupe') },
-        onChange: function () {
-          Lampa.Settings.update();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'HideFolders' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_hide_folders') },
-        onChange: function () {
-          Lampa.Settings.update();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'TmdbPosters' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_tmdb_posters') },
-        onChange: function () {
-          clearTmdbMetaCache();
-          Lampa.Settings.update();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { type: 'trigger', default: false, name: STORAGE_PREFIX + 'TapPlay' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_tap_play') },
-        onChange: function () {
-          Lampa.Settings.update();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { type: 'trigger', default: true, name: STORAGE_PREFIX + 'SyncWatched' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_sync_watched') },
-        onChange: function () {
-          Lampa.Settings.update();
-          scheduleTmdbSyncFromLibrary();
-        },
-      });
+      registerCatalogParams(component);
+      registerPlaybackParams(component);
+      registerSyncParams(component);
     }
 
     if (typeof Lampa.Settings.create === 'function') {
@@ -10795,54 +11069,124 @@
     registerDisplayParams(SETTINGS_COMPONENT);
   }
 
+  function paintJellyfinConnDot(state) {
+    try {
+      var $dot = $('.jellyfin-url-status__dot');
+      if (!$dot || !$dot.length) return;
+      $dot.removeClass(
+        'jellyfin-conn-dot--idle jellyfin-conn-dot--check jellyfin-conn-dot--ok jellyfin-conn-dot--bad'
+      ).addClass(
+        state === 'ok' ? 'jellyfin-conn-dot--ok' :
+        state === 'bad' ? 'jellyfin-conn-dot--bad' :
+        state === 'check' ? 'jellyfin-conn-dot--check' :
+        'jellyfin-conn-dot--idle'
+      );
+    } catch (e) { }
+  }
+
+  function checkJellyfinConnection() {
+    try {
+      if (!apiBase() || !apiKey()) {
+        jellyfinUrlConnState = 'idle';
+        paintJellyfinConnDot('idle');
+        return;
+      }
+      if (jellyfinConnCheckBusy) return;
+      jellyfinConnCheckBusy = true;
+      jellyfinUrlConnState = 'check';
+      paintJellyfinConnDot('check');
+      jfHttp('/System/Info', { cache: false, timeout: 8000 })
+        .then(function () {
+          jellyfinUrlConnState = 'ok';
+          paintJellyfinConnDot('ok');
+        })
+        .catch(function () {
+          jellyfinUrlConnState = 'bad';
+          paintJellyfinConnDot('bad');
+        })
+        .finally(function () {
+          jellyfinConnCheckBusy = false;
+        });
+    } catch (e) { }
+  }
+
   function addApiSettings() {
+    if (Lampa.Params && Lampa.Params.defaults) {
+      Lampa.Params.defaults[STORAGE_PREFIX + 'Url'] = '';
+      Lampa.Params.defaults[STORAGE_PREFIX + 'Key'] = '';
+    }
+
     function registerApiParams(component) {
       Lampa.SettingsApi.addParam({
         component: component,
         param: { name: STORAGE_PREFIX + 'Url',
           type: 'input',
-          default: DEFAULT_URL,
+          default: '',
           values: '',
+          placeholder: '',
         },
         field: { name: Lampa.Lang.translate('jellyfin_url') },
+        onRender: function (item) {
+          if (!item || !item.append) return;
+          var $holder = $(item).find('.settings-param__value');
+          if (!$holder.length) $holder = $(item);
+
+          function sanitize() {
+            if (!$holder[0]) return;
+            var nodes = $holder[0].childNodes;
+            for (var i = 0; i < nodes.length; i++) {
+              if (nodes[i].nodeType === 3 && nodes[i].textContent === 'undefined') {
+                nodes[i].textContent = '';
+              }
+            }
+          }
+          function ensureDot() {
+            if (!$holder[0]) return;
+            if ($holder.find('.jellyfin-url-status__dot').length) return;
+            $holder.addClass('jellyfin-url-field');
+            $holder[0].insertAdjacentHTML('afterbegin',
+              '<span class="jellyfin-conn-dot jellyfin-conn-dot--idle jellyfin-url-status__dot"></span>'
+            );
+            $holder.find('.jellyfin-url-status__dot').on('click', checkJellyfinConnection);
+            paintJellyfinConnDot(jellyfinUrlConnState);
+          }
+
+          sanitize();
+          ensureDot();
+          if (jellyfinUrlConnState === 'ok' || jellyfinUrlConnState === 'bad') {
+            paintJellyfinConnDot(jellyfinUrlConnState);
+          } else {
+            checkJellyfinConnection();
+          }
+          if ($holder[0] && !$holder[0]._jellyfinObs) {
+            $holder[0]._jellyfinObs = new MutationObserver(function () {
+              sanitize();
+              ensureDot();
+            });
+            $holder[0]._jellyfinObs.observe($holder[0], { childList: true, characterData: true, subtree: true });
+          }
+        },
         onChange: function () {
           invalidateUserCache();
           prefetchAutoUser();
+          jellyfinUrlConnState = '';
           Lampa.Settings.update();
           syncUserInfoField();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: {
-          name: STORAGE_PREFIX + 'Key',
-          type: 'input',
-          default: DEFAULT_API_KEY,
-          values: '',
-        },
-        field: { name: Lampa.Lang.translate('jellyfin_key') },
-        onChange: function () {
-          invalidateUserCache();
-          prefetchAutoUser();
-          Lampa.Settings.update();
-          syncUserInfoField();
-        },
-      });
-
-      Lampa.SettingsApi.addParam({
-        component: component,
-        param: { name: STORAGE_PREFIX + 'UserInfo', type: 'static' },
-        field: {
-          name: Lampa.Lang.translate('jellyfin_user'),
-          description: currentUserLabel(),
+          checkJellyfinConnection();
         },
       });
 
       Lampa.SettingsApi.addParam({
         component: component,
         param: { type: 'button', name: STORAGE_PREFIX + 'PickUser' },
-        field: { name: Lampa.Lang.translate('jellyfin_user_pick') },
+        field: {
+          name: Lampa.Lang.translate('jellyfin_user_pick'),
+          description: currentUserLabel(),
+        },
+        onRender: function (item) {
+          var $descr = $(item).find('.settings-param__descr');
+          if ($descr.length) $descr.text(currentUserLabel());
+        },
         onChange: function () {
           pickUserFromList(function () {
             Lampa.Settings.update();
@@ -10852,19 +11196,20 @@
 
       Lampa.SettingsApi.addParam({
         component: component,
-        param: { type: 'button', name: STORAGE_PREFIX + 'Test' },
-        field: { name: Lampa.Lang.translate('jellyfin_test') },
+        param: {
+          name: STORAGE_PREFIX + 'Key',
+          type: 'input',
+          default: '',
+          values: '',
+          placeholder: '',
+        },
+        field: { name: Lampa.Lang.translate('jellyfin_key') },
         onChange: function () {
-          resolveUserId()
-            .then(function () {
-              return refreshLibraryIndex(true);
-            })
-            .then(function () {
-              Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_auth_ok') });
-            })
-            .catch(function () {
-              Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_auth_fail') });
-            });
+          invalidateUserCache();
+          prefetchAutoUser();
+          Lampa.Settings.update();
+          syncUserInfoField();
+          checkJellyfinConnection();
         },
       });
     }
@@ -10872,13 +11217,13 @@
     if (typeof Lampa.Settings.create === 'function') {
       Lampa.Template.add('settings_' + API_COMPONENT, '<div></div>');
 
+      registerApiParams(API_COMPONENT);
+
       Lampa.SettingsApi.addParam({
         component: API_COMPONENT,
         param: { name: STORAGE_PREFIX + 'ApiHint', type: 'static' },
         field: { name: Lampa.Lang.translate('jellyfin_set_api_hint') },
       });
-
-      registerApiParams(API_COMPONENT);
 
       Lampa.SettingsApi.addParam({
         component: SETTINGS_COMPONENT,
@@ -10895,13 +11240,13 @@
       return;
     }
 
+    registerApiParams(SETTINGS_COMPONENT);
+
     Lampa.SettingsApi.addParam({
       component: SETTINGS_COMPONENT,
       param: { name: STORAGE_PREFIX + 'ApiHint', type: 'static' },
       field: { name: Lampa.Lang.translate('jellyfin_set_api_hint') },
     });
-
-    registerApiParams(SETTINGS_COMPONENT);
   }
 
   function addCategoriesSettings() {
@@ -10944,18 +11289,6 @@
         registerToggle(CATEGORIES_COMPONENT, key);
       });
 
-      Lampa.SettingsApi.addParam({
-        component: SETTINGS_COMPONENT,
-        param: { type: 'button', name: STORAGE_PREFIX + 'Categories' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_categories_btn') },
-        onChange: function () {
-          Lampa.Settings.create(CATEGORIES_COMPONENT, {
-            onBack: function () {
-              Lampa.Settings.create(SETTINGS_COMPONENT);
-            },
-          });
-        },
-      });
       return;
     }
 
@@ -11653,6 +11986,7 @@
     sessionTimer: null,
     sessionToken: 0,
     sessionPaused: false,
+    sessionResolving: '',
     jfActiveHash: '',
     jfLastWriteAt: 0,
   };
@@ -11685,7 +12019,7 @@
   function tmdbSyncShouldPush(hash, pct) {
     var rec = tmdbSync.pushed[hash];
     if (!rec) return true;
-    if (Date.now() - rec.at > 300000) return true;
+    if (Date.now() - rec.at > TMDB_PUSH_DEDUP_MS) return true;
     return rec.pct !== Math.round(Number(pct) || 0);
   }
 
@@ -11701,7 +12035,7 @@
   function tmdbSyncGuardHit(hash, pct) {
     if (!hash || !tmdbSync.guards[hash]) return false;
     var g = tmdbSync.guards[hash];
-    if (Date.now() - g.at >= 60000) {
+    if (Date.now() - g.at >= TMDB_GUARD_RETAIN_MS) {
       delete tmdbSync.guards[hash];
       return false;
     }
@@ -12080,7 +12414,7 @@
   function flushTmdbSyncSession(force) {
     if (!tmdbSync.session || !tmdbSync.session.itemId) return;
     var now = Date.now();
-    if (!force && now - (tmdbSync.session.lastReportAt || 0) < 10000) return;
+    if (!force && now - (tmdbSync.session.lastReportAt || 0) < TMDB_SESSION_INTERVAL_MS) return;
     if (tmdbSync.sessionBusy) {
       tmdbSync.sessionQueued = true;
       return;
@@ -12111,6 +12445,7 @@
         var old = tmdbSync.session;
         tmdbSync.session = null;
         tmdbSync.sessionQueued = false;
+        tmdbSync.sessionResolving = '';
         tmdbSyncSessionStopSchedule();
         sendTmdbSyncReport('stopped', old);
       }
@@ -12122,6 +12457,10 @@
         flushTmdbSyncSession(false);
         return;
       }
+
+      var resolveKey = String(desc.hash);
+      if (tmdbSync.sessionResolving === resolveKey) return;
+      tmdbSync.sessionResolving = resolveKey;
 
       var userId = '';
       resolveUserId()
@@ -12142,7 +12481,12 @@
           return row;
         })
         .then(function (row) {
-          if (token !== tmdbSync.sessionToken || !row) return;
+          if (token !== tmdbSync.sessionToken) {
+            if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
+            return;
+          }
+          if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
+          if (!row) return;
           tmdbSync.session = {
             hash: String(desc.hash),
             itemId: String(row.id),
@@ -12158,16 +12502,23 @@
           };
           flushTmdbSyncSession(true);
           scheduleTmdbSyncSessionRepeat();
+        })
+        .catch(function () {
+          if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
         });
     } catch (e) { }
   }
 
-  function tmdbSyncStopSession() {
+  function tmdbSyncStopSession(complete) {
     if (!tmdbSync.session || !tmdbSync.session.itemId) return;
     var old = tmdbSync.session;
+    if (complete && Number(old.durationSec) > 0) {
+      old.positionSec = Math.max(Number(old.positionSec) || 0, Number(old.durationSec));
+    }
     tmdbSync.session = null;
     tmdbSync.sessionQueued = false;
     tmdbSync.sessionToken++;
+    tmdbSync.sessionResolving = '';
     tmdbSyncSessionStopSchedule();
     sendTmdbSyncReport('stopped', old);
   }
@@ -12345,6 +12696,31 @@
       .catch(function () { });
   }
 
+  function tmdbSyncRegisterSeriesDescriptors(tmdb, seriesRow) {
+    if (!tmdb || String(tmdb.method) !== 'tv' || !seriesRow || !seriesRow.id) return Promise.resolve();
+    return tmdbSyncFetchMeta(tmdb)
+      .then(function (meta) {
+        var name = meta && (meta.originalName || meta.originalTitle);
+        if (!name) return;
+        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
+          (rows || []).forEach(function (r) {
+            if (!r.raw) return;
+            var n = episodeNumbers(r.raw);
+            if (n.season && n.episode) {
+              tmdbSyncDescriptor(
+                tmdbEpisodeHash(name, n.season, n.episode),
+                'tv',
+                String(tmdb.id),
+                n.season,
+                n.episode
+              );
+            }
+          });
+        });
+      })
+      .catch(function () { });
+  }
+
   function tmdbSyncRegisterCard(object) {
     try {
       if (!tmdbSyncEnabled() || !object) return;
@@ -12375,6 +12751,7 @@
       resolveTmdbJellyfinRowAsync({ method: 'tv', id: id })
         .then(function (resolved) {
           if (resolved && resolved.tmdb) {
+            tmdbSyncRegisterSeriesDescriptors({ method: 'tv', id: id }, resolved);
             try {
               tmdbSyncSyncSeriesFromJellyfin(resolved);
             } catch (err) { }
@@ -12448,7 +12825,7 @@
     var hash = tmdbSync.jfActiveHash;
     if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
     var now = Date.now();
-    if (now - (tmdbSync.jfLastWriteAt || 0) < 10000) return;
+    if (now - (tmdbSync.jfLastWriteAt || 0) < TMDB_MIRROR_INTERVAL_MS) return;
     var dur = Number(dsec) || 0;
     var t = Number(tsec) || 0;
     if (dur <= 0 || t <= 0) return;
@@ -12491,14 +12868,26 @@
     }
     if (!desc) return;
     if (pct >= 90) {
-      tmdbSyncStopSession();
+      tmdbSyncStopSession(true);
       tmdbPushWatchedDesc(desc);
     } else if (pct === 0) {
-      tmdbSyncStopSession();
-      tmdbPushUnwatchedDesc(desc);
+      if (!tmdbSyncPlayerActive()) {
+        tmdbSyncStopSession(false);
+        tmdbPushUnwatchedDesc(desc);
+      }
     } else {
       tmdbSyncReportSession(desc, Number(road.time) || 0, Number(road.duration) || 0);
     }
+  }
+
+  function tmdbSyncPlayerActive() {
+    try {
+      if (Lampa.Player && typeof Lampa.Player.playdata === 'function') {
+        var w = Lampa.Player.playdata();
+        return !!(w && typeof w === 'object');
+      }
+    } catch (e) { }
+    return false;
   }
 
   var initDone = false;
