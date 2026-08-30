@@ -416,6 +416,11 @@
         ru: 'Смотреть из Jellyfin',
       },
       jellyfin_pick_quality: { en: 'Choose quality', ru: 'Выберите качество' },
+      jellyfin_pick_combined: { en: 'Playback settings', ru: 'Настройки воспроизведения' },
+      jellyfin_comb_quality: { en: 'Quality', ru: 'Качество' },
+      jellyfin_comb_audio: { en: 'Audio track', ru: 'Звуковая дорожка' },
+      jellyfin_comb_subs: { en: 'Subtitles', ru: 'Субтитры' },
+      jellyfin_comb_play: { en: 'Play', ru: 'Воспроизвести' },
       jellyfin_play_4k: { en: 'Play 4K', ru: 'Смотреть 4K' },
       jellyfin_play_1080: { en: 'Play 1080p', ru: 'Смотреть 1080p' },
       jellyfin_watched: { en: 'Watched', ru: 'Просмотрено' },
@@ -1126,6 +1131,13 @@
     if (external[player]) return false;
 
     return true;
+  }
+
+  function isAndroidExternal() {
+    var Platform = Lampa.Platform;
+    if (!Platform || typeof Platform.is !== 'function') return false;
+    if (!Platform.is('android')) return false;
+    return !usesLampaNativePlayer();
   }
 
   function transcodingEnabled() {
@@ -2611,6 +2623,285 @@
     }
   }
 
+  var combQuality = null;
+  var combAudioIndex = null;
+  var combSubValue = '';
+
+  function combSubLabel(prefLang) {
+    if (prefLang === '__auto__') return Lampa.Lang.translate('jellyfin_subs_auto');
+    if (!prefLang) return Lampa.Lang.translate('jellyfin_subs_none');
+    return prefLang;
+  }
+
+  function combSubValueLabel() {
+    var v = String(combSubValue || '');
+    if (v === '__auto__') return Lampa.Lang.translate('jellyfin_subs_auto');
+    if (!v || v === '__none__') return Lampa.Lang.translate('jellyfin_subs_none');
+    if (v.indexOf('__lang__') === 0) return v.slice('__lang__'.length);
+    return v;
+  }
+
+  function storedSubValue() {
+    try {
+      var s = String(Lampa.Storage.get(STORAGE_PREFIX + 'SubLang') || '');
+      if (s === '__auto__') return '__auto__';
+      if (!s) return '__none__';
+      return '__lang__' + s;
+    } catch (e) {
+      return '__none__';
+    }
+  }
+
+  function combAudioLabel(audios) {
+    if (combAudioIndex === null || combAudioIndex === undefined) {
+      return Lampa.Lang.translate('jellyfin_audio_default');
+    }
+    for (var i = 0; i < audios.length; i++) {
+      if (Number(audios[i].Index) === Number(combAudioIndex)) {
+        return String(audios[i].DisplayTitle || audios[i].Language || ('Audio ' + (Number(audios[i].Index) + 1)));
+      }
+    }
+    return Lampa.Lang.translate('jellyfin_audio_default');
+  }
+
+  function combQualityLabel() {
+    if (!combQuality || combQuality.kind === 'auto') {
+      return Lampa.Lang.translate('jellyfin_quality_auto');
+    }
+    if (combQuality.kind === 'preset') return String(combQuality.value || '');
+    return qualityMenuLabel(combQuality.value);
+  }
+
+  function buildCombinedQualityList(row) {
+    var items = [
+      { title: Lampa.Lang.translate('jellyfin_quality_auto'), kind: 'auto', value: null },
+    ];
+    var trans = externalQualityOptionsForRow(row);
+    trans.forEach(function (q) {
+      items.push({ title: q.title, kind: 'preset', value: q.key });
+    });
+    guessExternalQualityTargets(row).forEach(function (t) {
+      var dup = false;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].kind === 'preset' && String(items[i].value).toLowerCase() === String(t).toLowerCase()) {
+          dup = true;
+          break;
+        }
+      }
+      if (!dup) items.push({ title: qualityMenuLabel(t), kind: 'target', value: t });
+    });
+    return items;
+  }
+
+  function resolveCombinedRow(row) {
+    var playTarget = rowWithVariant(row, resolvePlayVariant(row) || {});
+    var ms = mediaSourceForPlayTarget(playTarget.raw, playTarget.mediaSourceId) || {};
+    var streams = (ms && ms.MediaStreams) || [];
+    var subs = [];
+    var audios = [];
+    for (var i = 0; i < streams.length; i++) {
+      var s = streams[i] || {};
+      if (s.Type === 'Subtitle' && subtitleCodecSupported(s.Codec) && !junkSubtitleStream(s)) {
+        subs.push(s);
+      } else if (s.Type === 'Audio') {
+        audios.push(s);
+      }
+    }
+    return { playTarget: playTarget, subs: subs, audios: audios, ctl: enabledControllerName() };
+  }
+
+  function showCombinedPlayMenu(row, allRows, opts) {
+    var ctl = enabledControllerName();
+    var resolved = resolveCombinedRow(row);
+    var subs = resolved.subs;
+    var audios = resolved.audios;
+    var ql = buildCombinedQualityList(row);
+
+    var qualityItem = {
+      title: Lampa.Lang.translate('jellyfin_comb_quality'),
+      subtitle: combQualityLabel(),
+      action: 'quality',
+    };
+    var audioItem = {
+      title: Lampa.Lang.translate('jellyfin_comb_audio'),
+      subtitle: combAudioLabel(audios),
+      action: 'audio',
+    };
+    var subItem = {
+      title: Lampa.Lang.translate('jellyfin_comb_subs'),
+      subtitle: combSubValueLabel(),
+      action: 'subs',
+    };
+    var playItem = {
+      title: Lampa.Lang.translate('jellyfin_comb_play'),
+      subtitle: combQualityLabel() + ' · ' + combAudioLabel(audios) + ' · ' + combSubValueLabel(),
+      action: 'play',
+    };
+
+    var items = [playItem, qualityItem, audioItem, subItem];
+
+    Lampa.Select.show({
+      title: Lampa.Lang.translate('jellyfin_pick_combined'),
+      items: items,
+      onBack: function () {
+        restoreController(ctl);
+      },
+      onSelect: function (sel) {
+        if (!sel) return;
+        var action = sel.action || '';
+        if (action === 'play') {
+          combApplyAndLaunch(row, allRows, opts, ctl, ql);
+          return;
+        }
+        if (action === 'quality') {
+          var qItems = ql.map(function (q) {
+            var selected = combQualitySel(q) ? '  ✓' : '';
+            return {
+              title: q.title + selected,
+              subtitle: externalPlayerSubtitle(),
+              kind: q.kind,
+              value: q.value,
+            };
+          });
+          Lampa.Select.show({
+            title: Lampa.Lang.translate('jellyfin_pick_quality'),
+            items: qItems,
+            onBack: function () {
+              restoreController(ctl);
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+            onSelect: function (q) {
+              if (!q || !q.kind) return;
+              combQuality = { kind: q.kind, value: q.value };
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+          });
+          return;
+        }
+        if (action === 'audio') {
+          if (!audios.length) {
+            showCombinedPlayMenu(row, allRows, opts);
+            return;
+          }
+          var audioItems = [{
+            title: Lampa.Lang.translate('jellyfin_audio_default') + (combAudioIndex === null ? '  ✓' : ''),
+            subtitle: externalPlayerSubtitle(),
+            value: -1,
+          }];
+          audios.forEach(function (as) {
+            var at = String(as.DisplayTitle || as.Language || ('Audio ' + (Number(as.Index) + 1)));
+            audioItems.push({
+              title: at + (combAudioIndex === Number(as.Index) ? '  ✓' : ''),
+              subtitle: externalPlayerSubtitle(),
+              value: Number(as.Index),
+            });
+          });
+          Lampa.Select.show({
+            title: Lampa.Lang.translate('jellyfin_audio_default'),
+            items: audioItems,
+            onBack: function () {
+              restoreController(ctl);
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+            onSelect: function (a) {
+              if (!a) return;
+              combAudioIndex = (typeof a.value !== 'undefined' && a.value === -1) ? null : a.value;
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+          });
+          return;
+        }
+        if (action === 'subs') {
+          var curLang = combSubValue;
+          var subItems = [{
+            title: Lampa.Lang.translate('jellyfin_subs_none') + (curLang === '__none__' || !curLang ? '  ✓' : ''),
+            subtitle: externalPlayerSubtitle(),
+            value: '__none__',
+          }, {
+            title: Lampa.Lang.translate('jellyfin_subs_auto') + (curLang === '__auto__' ? '  ✓' : ''),
+            subtitle: externalPlayerSubtitle(),
+            value: '__auto__',
+          }];
+          subs.forEach(function (ss) {
+            var lang = String(ss.Language || '');
+            var st = String(ss.DisplayTitle || lang || 'Subtitle');
+            subItems.push({
+              title: st + (curLang === '__lang__' + lang ? '  ✓' : ''),
+              subtitle: externalPlayerSubtitle(),
+              value: '__lang__' + lang,
+            });
+          });
+          Lampa.Select.show({
+            title: Lampa.Lang.translate('jellyfin_comb_subs'),
+            items: subItems,
+            onBack: function () {
+              restoreController(ctl);
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+            onSelect: function (s) {
+              if (!s) return;
+              combSubValue = String(s.value || '');
+              showCombinedPlayMenu(row, allRows, opts);
+            },
+          });
+          return;
+        }
+      },
+    });
+  }
+
+  function combQualitySel(q) {
+    if (!combQuality) return q.kind === 'auto';
+    return combQuality.kind === q.kind && String(combQuality.value) === String(q.value);
+  }
+
+  function combApplyAndLaunch(row, allRows, opts, ctl, ql) {
+    var q = combQuality || { kind: 'auto', value: null };
+    if (combAudioIndex !== null && combAudioIndex !== undefined) {
+      var resolved = resolveCombinedRow(row);
+      var valid = false;
+      for (var ai = 0; ai < resolved.audios.length; ai++) {
+        if (Number(resolved.audios[ai].Index) === Number(combAudioIndex)) {
+          valid = true;
+          break;
+        }
+      }
+      if (!valid) combAudioIndex = null;
+    }
+    try {
+      if (combSubValue === '__none__' || !combSubValue) {
+        Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', '');
+      } else if (combSubValue === '__auto__') {
+        Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', '__auto__');
+      } else if (combSubValue.indexOf('__lang__') === 0) {
+        Lampa.Storage.set(STORAGE_PREFIX + 'SubLang', combSubValue.slice('__lang__'.length));
+      }
+    } catch (e) { }
+    currentAudioStreamIndex = combAudioIndex;
+    var launch = function () {
+      var po = Object.assign({}, opts || {});
+      var streamOpts = Object.assign({ singleStream: true }, po);
+      if (q.kind === 'preset') {
+        streamOpts.forceTranscode = true;
+        streamOpts.qualityPreset = q.value;
+        playRow(row, allRows, streamOpts);
+        return;
+      }
+      if (q.kind === 'target') {
+        var variant = findVariantForQuality(row, q.value);
+        if (!variant) {
+          Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
+          return;
+        }
+        streamOpts.qualityTarget = q.value;
+        playRow(rowWithVariant(row, variant), allRows, streamOpts);
+        return;
+      }
+      playRow(row, allRows, streamOpts);
+    };
+    launchPlayerFromSelect(ctl, launch);
+  }
+
   function launchExternal(row, allRows, opts, launch) {
     if (externalTracksEnabled()) {
       showExternalTracksPicker(row, allRows, opts, launch);
@@ -2705,6 +2996,13 @@
     ensurePlaybackVariants(row)
       .then(function (ready) {
         if (!usesLampaNativePlayer()) {
+          if (isAndroidExternal()) {
+            combQuality = null;
+            combAudioIndex = null;
+            combSubValue = storedSubValue();
+            showCombinedPlayMenu(ready, allRows, {});
+            return;
+          }
           if (externalQualityPickerEnabled()) {
             showExternalTranscodeQualityPicker(ready, allRows, {});
             return;
@@ -6684,6 +6982,58 @@
     externalPlayTicker = null;
   }
 
+  function restoreAndroidSeriesBackRoot() {
+    try {
+      var Platform = Lampa.Platform;
+      var isAndroidExternal =
+        Platform &&
+        typeof Platform.is === 'function' &&
+        Platform.is('android') &&
+        !usesLampaNativePlayer();
+      if (!isAndroidExternal || !externalPlay || !externalPlay.rowId) return;
+      var active = Lampa.Activity && Lampa.Activity.active && Lampa.Activity.active();
+      if (!active) return;
+      var comp = String(active.component || '');
+      var isSeriesContext =
+        comp === EPISODES_COMPONENT ||
+        (comp === 'full' &&
+          (active.seriesId ||
+            active.jellyfinRow ||
+            (active.card && active.card.source === 'jellyfin') ||
+            (active.url && String(active.url).indexOf('jellyfin/') === 0)));
+      if (!isSeriesContext) return;
+      var root = null;
+      var rec = readReturnRecord();
+      var currentId = String(active.seriesId || (active.card && active.card.id) || '');
+      if (rec && rec.target && rec.target.component && currentId && String(rec.forId) === currentId) {
+        root = rec.target;
+      }
+      if (!root) {
+        root = {
+          url: jellyfinNavUrl(['jellyfin', 'home']),
+          title: Lampa.Lang.translate('jellyfin_home'),
+          component: HUB_COMPONENT,
+          page: 1,
+        };
+      }
+      var current = {
+        component: comp,
+        source: active.source,
+        card: active.card,
+        url: active.url,
+        seriesId: active.seriesId,
+        id: active.id,
+        method: active.method,
+        jellyfinRow: active.jellyfinRow,
+        title: active.title,
+      };
+      Lampa.Activity.replace(root, true);
+      setTimeout(function () {
+        Lampa.Activity.push(current);
+      }, 0);
+    } catch (e) {}
+  }
+
   function reAnchorExternalFromPlayer() {
     try {
       if (!externalPlay || !externalPlay.rowId) return;
@@ -7491,6 +7841,13 @@
   }
 
   function playMediaRowDirect(row) {
+    if ((row.type === 'Movie' || row.type === 'Episode') && isAndroidExternal()) {
+      combQuality = null;
+      combAudioIndex = null;
+      combSubValue = storedSubValue();
+      showCombinedPlayMenu(row, null, {});
+      return;
+    }
     if ((row.type === 'Movie' || row.type === 'Episode') && externalQualityPickerEnabled()) {
       showExternalTranscodeQualityPicker(row, null, {});
       return;
@@ -13694,6 +14051,7 @@
               syncFlushPlaybackProgress(true);
               reAnchorExternalFromPlayer();
               startExternalPlaybackTicker();
+              restoreAndroidSeriesBackRoot();
             }
           }
         });
@@ -13705,6 +14063,7 @@
               syncFlushPlaybackProgress(true);
               reAnchorExternalFromPlayer();
               startExternalPlaybackTicker();
+              restoreAndroidSeriesBackRoot();
             }
           }
         });
