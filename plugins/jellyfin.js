@@ -3770,7 +3770,10 @@
     }
     $card.on('jf:update', function (_e, updated) {
       if (ctx && ctx.seriesDisplay) updated = episodeSeriesDisplayRow(updated);
-      injectCardChrome($card, updated, { hubLine: !!(ctx && ctx.compact) });
+      injectCardChrome($card, updated, {
+        hubLine: !!(ctx && ctx.compact),
+        homeMedia: !!(ctx && ctx.homeMedia),
+      });
       updateCardPoster($card, updated);
       $card.find('.card__title').text(ctx && ctx.compact ? hubCardTitle(updated) : updated.title);
       if (updated.year) $card.find('.card__age').text(updated.year);
@@ -3809,7 +3812,10 @@
     $card.addClass('card--loaded jellyfin-card');
     if (ctx && ctx.compact) $card.addClass('jellyfin-card--hub-line');
     updateCardPoster($card, row);
-    injectCardChrome($card, row, { hubLine: !!(ctx && ctx.compact) });
+    injectCardChrome($card, row, {
+      hubLine: !!(ctx && ctx.compact),
+      homeMedia: !!(ctx && ctx.homeMedia),
+    });
     if (ctx && ctx.compact) applyHubCardMeta($card, row);
     bindJellyfinCard($card, row, ctx);
     if (ctx.cardsById) ctx.cardsById[String(row.id)] = { $card: $card, row: row };
@@ -4098,6 +4104,21 @@
   function isHomeMediaLibrary(library) {
     var ct = String((library && library.CollectionType) || '').toLowerCase();
     return ct === 'homevideos' || ct === 'photos';
+  }
+
+  function isHomePhotoRow(row) {
+    var t = String((row && (row.type || (row.raw && row.raw.Type))) || '');
+    return t === 'Photo' || t === 'PhotoAlbum';
+  }
+
+  function isContainerRow(row) {
+    var t = String((row && (row.type || (row.raw && row.raw.Type))) || '');
+    return t === 'Folder' || t === 'PhotoAlbum' || t === 'CollectionFolder';
+  }
+
+  function isHomePhotoVideoRow(row) {
+    var t = String((row && (row.type || (row.raw && row.raw.Type))) || '');
+    return t === 'Photo' || t === 'Video' || t === 'PhotoAlbum';
   }
 
   function fetchLibraryItems(library, startIndex) {
@@ -6810,7 +6831,7 @@
     opts = opts || {};
     if (!row || !row.raw || !row.raw.Id) return;
     var type = String(row.type || row.raw.Type || '');
-    if (type !== 'Movie' && type !== 'Episode') return;
+    if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
     if (lastProgressResetRowId && String(row.raw.Id) === String(lastProgressResetRowId)) return;
 
     var dur = Number(durationSec) || 0;
@@ -7184,7 +7205,7 @@
       var type = isExt
         ? String(externalPlay.type || (row && (row.type || (row.raw && row.raw.Type))) || '')
         : String(row.type || row.raw.Type || '');
-      if (type !== 'Movie' && type !== 'Episode') return;
+      if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
       lastCompletedRowId = id;
       cachePlaybackState(id, type, 100, t, dur);
       if (isExt) anchorExternalPosition(dur);
@@ -7204,7 +7225,7 @@
     var row = currentPlaybackRow();
     if (!row || !row.raw) return;
     var type = String(row.type || row.raw.Type || '');
-    if (type !== 'Movie' && type !== 'Episode') return;
+    if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
     var id = String(row.raw.Id);
     lastCompletedRowId = id;
     cachePlaybackState(id, type, 100, 0, 0);
@@ -10283,7 +10304,7 @@
     if (row.type === 'Series') {
       items.push({ title: Lampa.Lang.translate('jellyfin_episodes'), action: 'episodes' });
     }
-    if (row.type !== 'Photo') {
+    if (!isHomePhotoRow(row) && !isContainerRow(row)) {
       items.push({
         title: Lampa.Lang.translate(row.watched ? 'jellyfin_mark_unwatched' : 'jellyfin_mark_watched'),
         action: row.watched ? 'unwatched' : 'watched',
@@ -10357,7 +10378,8 @@
         $chrome.append('<div class="jellyfin-badge jellyfin-badge-music">' + musicLabel + '</div>');
       }
     }
-    if (row.watched || row.playedPct >= 100) {
+    var hideWatched = isHomePhotoRow(row) || isContainerRow(row);
+    if (!hideWatched && (row.watched || row.playedPct >= 100)) {
       var watchedClass = 'jellyfin-badge jellyfin-badge-watched';
       if ($chrome.find('.jellyfin-badge-episode').length) watchedClass += ' jellyfin-badge-watched--episode';
       $chrome.append('<div class="' + watchedClass + '">✓</div>');
@@ -10719,7 +10741,7 @@
           label += ' (' + Math.round(ready.playedPct) + '%)';
         }
         items.push({ title: label, action: 'play' });
-        if (ready.type !== 'Photo') {
+        if (!isHomePhotoRow(ready) && !isContainerRow(ready)) {
           items.push({
             title: Lampa.Lang.translate(ready.watched ? 'jellyfin_mark_unwatched' : 'jellyfin_mark_watched'),
             action: ready.watched ? 'unwatched' : 'watched',
