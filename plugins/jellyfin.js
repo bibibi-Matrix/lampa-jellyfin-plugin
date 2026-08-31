@@ -4,7 +4,7 @@
   if (window.__jellyfinPlugin_loaded) return;
   window.__jellyfinPlugin_loaded = true;
 
-  var JELLYFIN_BUILD = 'Beta 16 (20260831)';
+  var JELLYFIN_BUILD = 'Beta 17 (20260831)';
 
   var STORAGE_PREFIX = 'jellyfin';
   var SETTINGS_COMPONENT = STORAGE_PREFIX;
@@ -126,6 +126,7 @@
   var jellyfinConnCheckBusy = false;
   var qcModalOpen = false;
   var qcPollTimer = null;
+  var jellyfinLastAuthMode = 'login';
 
   var cachedUserId = '';
   var cachedAutoUserName = '';
@@ -374,6 +375,26 @@
         en: 'You have been signed out.',
         ru: 'Выполнен выход.',
       },
+      jellyfin_auth_locked_msg: {
+        en: 'An active session is open. Sign out to change the authorization method.',
+        ru: 'Открыта активная сессия. Выполните выход, чтобы сменить способ авторизации.',
+      },
+      jellyfin_api_connect: {
+        en: 'Connect',
+        ru: 'Подключиться',
+      },
+      jellyfin_api_disconnect: {
+        en: 'Disconnect',
+        ru: 'Отключиться',
+      },
+      jellyfin_api_invalid: {
+        en: 'API key is empty.',
+        ru: 'API-ключ не указан.',
+      },
+      jellyfin_api_ok: {
+        en: 'Connected successfully.',
+        ru: 'Подключение выполнено успешно.',
+      },
       jellyfin_auth_mode_api: { en: 'API key', ru: 'API ключ' },
       jellyfin_auth_mode_qc: { en: 'Quick Connect', ru: 'Быстрое подключение' },
       jellyfin_conn_url_empty: {
@@ -592,9 +613,9 @@
   }
 
   function authMode() {
-    var m = storageStr('AuthMode', 'api');
-    if (m === 'login' || m === 'qc') return m;
-    return 'api';
+    var m = storageStr('AuthMode', 'login');
+    if (m === 'qc' || m === 'api') return m;
+    return 'login';
   }
 
   function storedToken() {
@@ -610,8 +631,19 @@
     return !!storedToken();
   }
 
+  function apiSessionOpen() {
+    if (authMode() !== 'api') return false;
+    var raw = null;
+    try {
+      raw = Lampa.Storage.get(STORAGE_PREFIX + 'ApiConnected');
+    } catch (e) { }
+    if (raw === true || raw === 'true' || raw === 1 || raw === '1') return true;
+    return false;
+  }
+
   function apiKey() {
     if (authMode() === 'login' || authMode() === 'qc') return storedToken();
+    if (!apiSessionOpen()) return '';
     var raw = null;
     try {
       raw = Lampa.Storage.get(STORAGE_PREFIX + 'Key');
@@ -622,8 +654,22 @@
 
   function hasApiKey() {
     if (authMode() === 'login' || authMode() === 'qc') return !!storedToken();
+    if (!apiSessionOpen()) return false;
     var raw = String(storageStr('Key', '') || '').trim();
     return raw.length > 0;
+  }
+
+  function apiConnected() {
+    if (authMode() !== 'api') return false;
+    if (!apiSessionOpen()) return false;
+    var raw = String(storageStr('Key', '') || '').trim();
+    return raw.length > 0;
+  }
+
+  function hasActiveAuthSession() {
+    if (isLoggedIn()) return true;
+    if (apiConnected()) return true;
+    return false;
   }
 
   function apiCacheKey(url) {
@@ -963,6 +1009,77 @@
     }
   }
 
+  function syncApiKeyRow(item) {
+    var $item = item || $('[data-name="' + STORAGE_PREFIX + 'ApiKeyLogout"]');
+    if (!$item || !$item.length) return;
+    var $name = $item.find('.settings-param__name');
+    if ($name.length) {
+      $name.text(
+        apiConnected()
+          ? Lampa.Lang.translate('jellyfin_api_disconnect')
+          : Lampa.Lang.translate('jellyfin_api_connect')
+      );
+    }
+  }
+
+  function connectApiKey() {
+    var base = apiBase();
+    if (!base) {
+      showJellyfinNoty(Lampa.Lang.translate('jellyfin_url_missing'));
+      return;
+    }
+    var rawKey = null;
+    try {
+      rawKey = Lampa.Storage.get(STORAGE_PREFIX + 'Key');
+    } catch (e) { }
+    var key = rawKey !== null && rawKey !== undefined && String(rawKey).trim() === ''
+      ? ''
+      : String(storageStr('Key', DEFAULT_API_KEY) || '').trim();
+    if (!key) {
+      showJellyfinNoty(Lampa.Lang.translate('jellyfin_api_invalid'));
+      return;
+    }
+    try {
+      Lampa.Storage.set(STORAGE_PREFIX + 'ApiConnected', '1');
+    } catch (e) { }
+    jellyfinUrlConnState = 'check';
+    paintJellyfinConnDot('check');
+    jfHttp('/System/Info', { cache: false, timeout: 8000 })
+      .then(function () {
+        jellyfinUrlConnState = 'ok';
+        paintJellyfinConnDot('ok');
+        invalidateUserCache();
+        try {
+          Lampa.Settings.update();
+        } catch (e) { }
+        syncApiKeyRow();
+        showJellyfinNoty(Lampa.Lang.translate('jellyfin_api_ok'));
+      })
+      .catch(function (err) {
+        storageClear('ApiConnected');
+        jellyfinUrlConnState = 'bad';
+        paintJellyfinConnDot('bad');
+        syncApiKeyRow();
+        showJellyfinNoty(
+          (err && err.message) || Lampa.Lang.translate('jellyfin_login_failed'),
+          300
+        );
+      });
+  }
+
+  function apiDisconnect() {
+    storageClear('ApiConnected');
+    invalidateUserCache();
+    syncUserInfoField();
+    syncApiKeyRow();
+    jellyfinUrlConnState = 'idle';
+    paintJellyfinConnDot('idle');
+    try {
+      Lampa.Settings.update();
+    } catch (e) { }
+    showJellyfinNoty(Lampa.Lang.translate('jellyfin_logged_out'));
+  }
+
   function currentConnectionLabel() {
     return isLoggedIn()
       ? Lampa.Lang.translate('jellyfin_logout_btn')
@@ -1197,6 +1314,7 @@
     jellyfinUrlConnState = '';
     syncLoginLogoutRow();
     syncQcStartRow();
+    syncApiKeyRow();
   }
 
   function authenticateJellyfin() {
@@ -12700,7 +12818,7 @@
     if (Lampa.Params && Lampa.Params.defaults) {
       Lampa.Params.defaults[STORAGE_PREFIX + 'Url'] = '';
       Lampa.Params.defaults[STORAGE_PREFIX + 'Key'] = '';
-      Lampa.Params.defaults[STORAGE_PREFIX + 'AuthMode'] = 'api';
+      Lampa.Params.defaults[STORAGE_PREFIX + 'AuthMode'] = 'login';
       Lampa.Params.defaults[STORAGE_PREFIX + 'Login'] = '';
       Lampa.Params.defaults[STORAGE_PREFIX + 'Password'] = '';
     }
@@ -12723,6 +12841,7 @@
         applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'Login"]'), 'login');
         applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'Password"]'), 'login');
         applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'LoginLogout"]'), 'login');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'ApiKeyLogout"]'), 'api');
         applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'PickUser"]'), 'api');
         applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'QcStart"]'), 'qc');
       } catch (e) { }
@@ -12804,7 +12923,7 @@
         param: {
           name: STORAGE_PREFIX + 'AuthMode',
           type: 'select',
-          default: 'api',
+          default: 'login',
           values: {
             login: Lampa.Lang.translate('jellyfin_auth_mode_login'),
             qc: Lampa.Lang.translate('jellyfin_auth_mode_qc'),
@@ -12813,9 +12932,23 @@
         },
         field: { name: Lampa.Lang.translate('jellyfin_auth_mode') },
         onRender: function () {
+          jellyfinLastAuthMode = authMode();
           applyAuthRows();
         },
         onChange: function (value) {
+          if (hasActiveAuthSession() && value !== jellyfinLastAuthMode) {
+            try {
+              Lampa.Storage.set(STORAGE_PREFIX + 'AuthMode', jellyfinLastAuthMode);
+            } catch (e) { }
+            applyAuthRows(jellyfinLastAuthMode);
+            try {
+              Lampa.Settings.update();
+            } catch (e) { }
+            syncUserInfoField();
+            showJellyfinNoty(Lampa.Lang.translate('jellyfin_auth_locked_msg'));
+            return;
+          }
+          jellyfinLastAuthMode = value;
           invalidateAuth();
           invalidateUserCache();
           applyAuthRows(value);
@@ -12842,11 +12975,15 @@
           maskJellyfinSecretRow(item, STORAGE_PREFIX + 'Key');
         },
         onChange: function () {
+          storageClear('ApiConnected');
           invalidateUserCache();
-          prefetchAutoUser();
-          Lampa.Settings.update();
+          syncApiKeyRow();
+          jellyfinUrlConnState = 'idle';
+          paintJellyfinConnDot('idle');
+          try {
+            Lampa.Settings.update();
+          } catch (e) { }
           syncUserInfoField();
-          checkJellyfinConnection();
         },
       });
 
@@ -12903,6 +13040,26 @@
             disconnectSession();
           } else {
             loginToSession();
+          }
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'button', name: STORAGE_PREFIX + 'ApiKeyLogout' },
+        field: {
+          name: Lampa.Lang.translate('jellyfin_api_connect'),
+          description: ' ',
+        },
+        onRender: function (item) {
+          applyAuthRow(item, 'api');
+          syncApiKeyRow(item);
+        },
+        onChange: function () {
+          if (apiConnected()) {
+            apiDisconnect();
+          } else {
+            connectApiKey();
           }
         },
       });
