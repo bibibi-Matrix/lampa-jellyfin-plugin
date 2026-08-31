@@ -4,6 +4,8 @@
   if (window.__jellyfinPlugin_loaded) return;
   window.__jellyfinPlugin_loaded = true;
 
+  var JELLYFIN_BUILD = 'Beta 16 (20260831)';
+
   var STORAGE_PREFIX = 'jellyfin';
   var SETTINGS_COMPONENT = STORAGE_PREFIX;
   var DISPLAY_COMPONENT = STORAGE_PREFIX + 'Display';
@@ -95,7 +97,7 @@
 
   var MANIFEST = {
     type: 'video',
-    version: '2.0.0 Beta 16',
+    version: '2.0.0',
     author: 'bibibi-Matrix',
     name: 'Jellyfin',
     description:
@@ -122,6 +124,8 @@
   var $menuBtnEl = null;
   var jellyfinUrlConnState = 'check';
   var jellyfinConnCheckBusy = false;
+  var qcModalOpen = false;
+  var qcPollTimer = null;
 
   var cachedUserId = '';
   var cachedAutoUserName = '';
@@ -317,13 +321,112 @@
         en: 'Media library categories',
         ru: 'Категории медиатеки',
       },
-      jellyfin_set_api_hint: {
-        en: 'API key is taken from Jellyfin Dashboard → Advanced → API Keys. The plugin uses the same key for all users.',
-        ru: 'API-ключ берётся из Jellyfin: Панель → Дополнительно → Ключи API. Один ключ используется для всех пользователей.',
+      jellyfin_set_api_btn: { en: 'Connection', ru: 'Соединение' },
+      jellyfin_auth_mode: {
+        en: 'Authorization method',
+        ru: 'Способ авторизации',
       },
-      jellyfin_set_api_btn: {
-        en: 'Server and user',
-        ru: 'Сервер и пользователь',
+      jellyfin_auth_mode_login: {
+        en: 'Username and password',
+        ru: 'Имя пользователя и пароль',
+      },
+      jellyfin_login_btn: {
+        en: 'Sign in',
+        ru: 'Вход',
+      },
+      jellyfin_logout_btn: {
+        en: 'Sign out',
+        ru: 'Выход',
+      },
+      jellyfin_logged_out_descr: {
+        en: 'Not logged in',
+        ru: 'Не выполнен вход',
+      },
+      jellyfin_logged_in_descr: {
+        en: 'Logged in as',
+        ru: 'Выполнен вход как',
+      },
+      jellyfin_login_failed: {
+        en: 'Sign in failed',
+        ru: 'Не удалось выполнить вход',
+      },
+      jellyfin_creds_locked: {
+        en: 'Sign out to change login and password.',
+        ru: 'Выполните выход, чтобы изменить логин и пароль.',
+      },
+      jellyfin_url_missing: {
+        en: 'Set the server URL first.',
+        ru: 'Укажите сначала адрес сервера.',
+      },
+      jellyfin_login_required: {
+        en: 'Enter your username.',
+        ru: 'Введите имя пользователя.',
+      },
+      jellyfin_password_required: {
+        en: 'Enter your password.',
+        ru: 'Введите пароль.',
+      },
+      jellyfin_logged_in: {
+        en: 'Signed in successfully.',
+        ru: 'Вход выполнен успешно.',
+      },
+      jellyfin_logged_out: {
+        en: 'You have been signed out.',
+        ru: 'Выполнен выход.',
+      },
+      jellyfin_auth_mode_api: { en: 'API key', ru: 'API ключ' },
+      jellyfin_auth_mode_qc: { en: 'Quick Connect', ru: 'Быстрое подключение' },
+      jellyfin_conn_url_empty: {
+        en: 'Quick Connect is disabled while no server URL is set.',
+        ru: 'Быстрое подключение недоступно, пока не указан адрес сервера.',
+      },
+      jellyfin_qc_start_btn: { en: 'Get code', ru: 'Получить код' },      jellyfin_qc_code: { en: 'Quick Connect code', ru: 'Код быстрого подключения' },
+      jellyfin_qc_enter_code: {
+        en: 'Open Jellyfin on another device, go to Settings → Quick Connect and enter this code:',
+        ru: 'Откройте Jellyfin на другом устройстве, перейдите в Настройки → Быстрое подключение и введите этот код:',
+      },
+      jellyfin_qc_waiting: {
+        en: 'Waiting for confirmation…',
+        ru: 'Ожидание подтверждения…',
+      },
+      jellyfin_qc_success: {
+        en: 'Quick Connect successful',
+        ru: 'Быстрое подключение выполнено успешно',
+      },
+      jellyfin_qc_disabled: {
+        en: 'Quick Connect is disabled on the server. Enable it in Jellyfin: Settings → Quick Connect.',
+        ru: 'Быстрое подключение отключено на сервере. Включите его в Jellyfin: Настройки → Быстрое подключение.',
+      },
+      jellyfin_qc_expired: {
+        en: 'Code expired or not found. Try again.',
+        ru: 'Код истёк или не найден. Попробуйте ещё раз.',
+      },
+      jellyfin_qc_reauth: {
+        en: 'Quick Connect session expired. Launch it again.',
+        ru: 'Сессия быстрого подключения истекла. Запустите его заново.',
+      },
+      jellyfin_qc_fail: { en: 'Quick Connect failed', ru: 'Не удалось выполнить быстрое подключение' },
+      jellyfin_qc_disconnect: {
+        en: 'Disconnect session',
+        ru: 'Отключиться',
+      },
+      jellyfin_qc_disconnecting: {
+        en: 'Disconnecting…',
+        ru: 'Отключение…',
+      },
+      jellyfin_qc_disconnected: {
+        en: 'Session revoked. You have been logged out.',
+        ru: 'Сессия отозвана. Вы отключены.',
+      },
+      jellyfin_session_expired: {
+        en: 'Your session has expired. Log in again.',
+        ru: 'Сессия истекла. Войдите заново.',
+      },
+      jellyfin_login: { en: 'Username', ru: 'Имя пользователя' },
+      jellyfin_password: { en: 'Password', ru: 'Пароль' },
+      jellyfin_error_apikey: {
+        en: 'Enter server address and API key',
+        ru: 'Укажите адрес сервера и API ключ',
       },
       jellyfin_set_display_btn: {
         en: 'Interface',
@@ -463,6 +566,15 @@
     return defaultOn !== false;
   }
 
+  function jellyfinCleanInput(raw) {
+    var v = String(raw == null ? '' : raw);
+    v = v.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u206a-\u206f\ufeff\ufff9-\ufffb]/g, '');
+    v = v.replace(/[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/g, ' ');
+    v = v.trim();
+    v = v.replace(/\s+/g, ' ');
+    return v;
+  }
+
   function normalizeBase(raw) {
     var s = String(raw || '').trim().replace(/\/+$/, '');
     if (!s.length) return '';
@@ -479,13 +591,39 @@
     return normalizeBase(storageStr('Url', DEFAULT_URL));
   }
 
+  function authMode() {
+    var m = storageStr('AuthMode', 'api');
+    if (m === 'login' || m === 'qc') return m;
+    return 'api';
+  }
+
+  function storedToken() {
+    var raw = null;
+    try {
+      raw = Lampa.Storage.get(STORAGE_PREFIX + 'Token');
+    } catch (e) { }
+    if (raw !== null && raw !== undefined && String(raw).trim() === '') return '';
+    return storageStr('Token', '');
+  }
+
+  function isLoggedIn() {
+    return !!storedToken();
+  }
+
   function apiKey() {
+    if (authMode() === 'login' || authMode() === 'qc') return storedToken();
     var raw = null;
     try {
       raw = Lampa.Storage.get(STORAGE_PREFIX + 'Key');
     } catch (e) { }
     if (raw !== null && raw !== undefined && String(raw).trim() === '') return '';
     return storageStr('Key', DEFAULT_API_KEY);
+  }
+
+  function hasApiKey() {
+    if (authMode() === 'login' || authMode() === 'qc') return !!storedToken();
+    var raw = String(storageStr('Key', '') || '').trim();
+    return raw.length > 0;
   }
 
   function apiCacheKey(url) {
@@ -612,10 +750,15 @@
     var key = apiKey();
     if (!base || !key) return Promise.reject(new Error('Jellyfin URL or API key is empty'));
 
+    var isLogin = authMode() === 'login' || authMode() === 'qc';
     var p = String(path || '');
     var url = base + (p.charAt(0) === '/' ? p : '/' + p);
-    var sep = url.indexOf('?') >= 0 ? '&' : '?';
-    if (url.indexOf('api_key=') < 0) url += sep + 'api_key=' + encodeURIComponent(key);
+    if (!isLogin) {
+      var sep = url.indexOf('?') >= 0 ? '&' : '?';
+      if (url.indexOf('api_key=') < 0) url += sep + 'api_key=' + encodeURIComponent(key);
+    }
+    var headers = {};
+    if (isLogin && key) headers['X-Emby-Token'] = key;
 
     var timeout = typeof opts.timeout === 'number' ? opts.timeout : HTTP_TIMEOUT_MS;
     var dataType = opts.dataType || 'json';
@@ -639,11 +782,14 @@
         resolve(raw);
       }
       function fail(err) {
+        var status = err && (err.status || (err.responseJSON && err.responseJSON.status) || 0);
         var msg =
-          (err && (err.decode_error || err.responseText || err.statusText || err.message)) ||
-          (err && err.responseJSON && err.responseJSON.title) ||
+          (err && (err.responseText || err.responseJSON && err.responseJSON.title || err.decode_error || err.statusText || err.message)) ||
           'Request failed';
-        reject(new Error(msg));
+        if (status) msg += ' [HTTP ' + status + ']';
+        var e = new Error(msg);
+        e.status = status || 0;
+        reject(e);
       }
 
       if (useJsonAjax) {
@@ -654,6 +800,7 @@
           dataType: dataType === 'text' ? 'text' : 'json',
           contentType: opts.jsonBody !== undefined ? 'application/json' : undefined,
           data: opts.jsonBody !== undefined ? JSON.stringify(opts.jsonBody) : undefined,
+          headers: headers,
         })
           .done(ok)
           .fail(fail);
@@ -661,12 +808,12 @@
       }
 
       if (!net) {
-        Lampa.Network.silent(url, ok, fail, postData, { timeout: timeout, dataType: dataType });
+        Lampa.Network.silent(url, ok, fail, postData, { timeout: timeout, dataType: dataType, headers: headers });
         return;
       }
 
       net.timeout(timeout);
-      net.silent(url, ok, fail, postData, { timeout: timeout, dataType: dataType });
+      net.silent(url, ok, fail, postData, { timeout: timeout, dataType: dataType, headers: headers });
     });
 
     if (useCache) {
@@ -792,6 +939,112 @@
   function syncUserInfoField() {
     var $descr = $('[data-name="' + STORAGE_PREFIX + 'PickUser"] .settings-param__descr');
     if ($descr.length) $descr.text(currentUserLabel());
+  }
+
+  function syncLoginLogoutRow(item) {
+    var $item = item || $('[data-name="' + STORAGE_PREFIX + 'LoginLogout"]');
+    if (!$item || !$item.length) return;
+    var $name = $item.find('.settings-param__name');
+    if ($name.length) $name.text(currentConnectionLabel());
+    var $descr = $item.find('.settings-param__descr');
+    if ($descr.length) $descr.text(connectionStateDescription());
+  }
+
+  function syncQcStartRow(item) {
+    var $item = item || $('[data-name="' + STORAGE_PREFIX + 'QcStart"]');
+    if (!$item || !$item.length) return;
+    var $name = $item.find('.settings-param__name');
+    if ($name.length) {
+      $name.text(
+        isLoggedIn()
+          ? Lampa.Lang.translate('jellyfin_qc_disconnect')
+          : Lampa.Lang.translate('jellyfin_qc_start_btn')
+      );
+    }
+  }
+
+  function currentConnectionLabel() {
+    return isLoggedIn()
+      ? Lampa.Lang.translate('jellyfin_logout_btn')
+      : Lampa.Lang.translate('jellyfin_login_btn');
+  }
+
+  function connectionStateDescription() {
+    if (isLoggedIn()) {
+      var label = storedUserLabel() || cachedAutoUserName;
+      return label ? String(label) : '';
+    }
+    return '';
+  }
+
+  function showJellyfinNoty(msg, delay) {
+    if (typeof Lampa.Noty === 'undefined' || typeof Lampa.Noty.show !== 'function') return;
+    if (!msg) return;
+    if (delay) {
+      setTimeout(function () {
+        Lampa.Noty.show(msg);
+      }, delay);
+    } else {
+      Lampa.Noty.show(msg);
+    }
+  }
+
+  function loginToSession() {
+    var base = apiBase();
+    if (!base) {
+      jellyfinUrlConnState = 'idle';
+      paintJellyfinConnDot('idle');
+      showJellyfinNoty(Lampa.Lang.translate('jellyfin_url_missing'));
+      return;
+    }
+    var login = jellyfinCleanInput(storageStr('Login', ''));
+    var pass = jellyfinCleanInput(storageStr('Password', ''));
+    if (!login) {
+      jellyfinUrlConnState = 'idle';
+      paintJellyfinConnDot('idle');
+      showJellyfinNoty(Lampa.Lang.translate('jellyfin_login_required'));
+      return;
+    }
+    if (!pass) {
+      jellyfinUrlConnState = 'idle';
+      paintJellyfinConnDot('idle');
+      showJellyfinNoty(Lampa.Lang.translate('jellyfin_password_required'));
+      return;
+    }
+    jellyfinUrlConnState = 'check';
+    paintJellyfinConnDot('check');
+    authenticateJellyfin()
+      .then(function () {
+        jellyfinUrlConnState = 'ok';
+        paintJellyfinConnDot('ok');
+        invalidateUserCache();
+        syncUserInfoField();
+        syncLoginLogoutRow();
+        showJellyfinNoty(Lampa.Lang.translate('jellyfin_logged_in'));
+      })
+      .catch(function (err) {
+        jellyfinUrlConnState = 'bad';
+        paintJellyfinConnDot('bad');
+        syncLoginLogoutRow();
+        showJellyfinNoty(
+          (err && err.message) || Lampa.Lang.translate('jellyfin_login_failed'),
+          300
+        );
+      });
+  }
+
+  function disconnectSession() {
+    var tok = storedToken();
+    invalidateAuth();
+    invalidateUserCache();
+    syncUserInfoField();
+    syncLoginLogoutRow();
+    jellyfinUrlConnState = 'idle';
+    paintJellyfinConnDot('idle');
+    if (tok) {
+      qcLogout(tok);
+    }
+    showJellyfinNoty(Lampa.Lang.translate('jellyfin_logged_out'));
   }
 
   function pickUserFromList(onDone) {
@@ -920,6 +1173,218 @@
     id = 'lampa-' + (Lampa.Utils && Lampa.Utils.uid ? Lampa.Utils.uid() : String(Date.now()));
     Lampa.Storage.set(key, id);
     return id;
+  }
+
+  function storageClear(suffix) {
+    var key = STORAGE_PREFIX + suffix;
+    try {
+      if (typeof window !== 'undefined' && window.localStorage && window.localStorage.removeItem) {
+        window.localStorage.removeItem(key);
+      }
+    } catch (e) { }
+    try {
+      Lampa.Storage.set(key, '');
+    } catch (e) { }
+  }
+
+  function invalidateAuth() {
+    storageClear('Token');
+    storageClear('UserId');
+    storageClear('UserName');
+    storageClear('UserLabel');
+    cachedUserId = '';
+    cachedAutoUserName = '';
+    jellyfinUrlConnState = '';
+    syncLoginLogoutRow();
+    syncQcStartRow();
+  }
+
+  function authenticateJellyfin() {
+    var base = apiBase();
+    var login = jellyfinCleanInput(storageStr('Login', ''));
+    var pass = jellyfinCleanInput(storageStr('Password', ''));
+    if (!base) return Promise.reject(new Error('Empty URL'));
+    if (!login || !pass) return Promise.reject(new Error('Empty credentials'));
+
+    var deviceId = getDeviceId();
+    var authHeader =
+      'MediaBrowser Client="Lampa", Device="Lampa", DeviceId="' +
+      deviceId +
+      '", Version="1.3.0"';
+
+    var postData = JSON.stringify({ Username: login, Pw: pass });
+    var url = base + '/Users/AuthenticateByName';
+    var opts = {
+      timeout: HTTP_TIMEOUT_MS,
+      dataType: 'json',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emby-Authorization': authHeader,
+      },
+    };
+
+    return new Promise(function (resolve, reject) {
+      function handleData(raw) {
+        var data = raw || null;
+        if (typeof data === 'string' && data.length) {
+          try {
+            data = JSON.parse(data);
+          } catch (e) { }
+        }
+        var token = data && data.AccessToken;
+        var user = data && data.User;
+        if (!token) {
+          reject(new Error('No access token'));
+          return;
+        }
+        try {
+          Lampa.Storage.set(STORAGE_PREFIX + 'Token', token);
+        } catch (e) { }
+        if (user && user.Id) {
+          try {
+            Lampa.Storage.set(STORAGE_PREFIX + 'UserId', String(user.Id));
+          } catch (e) { }
+        }
+        if (user && user.Name) {
+          try {
+            Lampa.Storage.set(STORAGE_PREFIX + 'UserName', String(user.Name));
+          } catch (e) { }
+        }
+        rememberAutoUser({ Name: user && user.Name, Id: user && user.Id });
+        resolve(data);
+      }
+      function fail(err) {
+        var status = err && err.status;
+        var rawText = '';
+        if (err && err.responseText) rawText = String(err.responseText);
+        else if (err && err.responseJSON) {
+          try {
+            rawText = JSON.stringify(err.responseJSON);
+          } catch (e) { }
+        }
+        rawText = rawText.replace(/\s+/g, ' ').trim();
+        if (rawText.length > 160) rawText = rawText.slice(0, 160) + '…';
+        var msg = rawText || (err && (err.decode_error || err.statusText || err.message)) || '';
+        if (!msg && status === 401) msg = 'Invalid username or password';
+        if (status) msg += ' [HTTP ' + status + ']';
+        reject(new Error(msg));
+      }
+      var net = network();
+      try {
+        if (net) {
+          net.timeout(HTTP_TIMEOUT_MS);
+          net.silent(url, handleData, fail, postData, opts);
+        } else if (Lampa.Network && typeof Lampa.Network.silent === 'function') {
+          Lampa.Network.silent(url, handleData, fail, postData, opts);
+        } else {
+          reject(new Error('No network'));
+        }
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function qcAuthHeader() {
+    var deviceId = getDeviceId();
+    return (
+      'MediaBrowser Client="Lampa", Device="Lampa", DeviceId="' +
+      deviceId +
+      '", Version="1.3.0"'
+    );
+  }
+
+  function qcHttp(url, postData, headers) {
+    return new Promise(function (resolve, reject) {
+      var net = network();
+      var opts = { timeout: HTTP_TIMEOUT_MS, dataType: 'json' };
+      if (headers) opts.headers = headers;
+      function ok(raw) {
+        if (typeof raw === 'string' && raw.length) {
+          try {
+            raw = JSON.parse(raw);
+          } catch (ignore) { }
+        }
+        resolve(raw);
+      }
+      function fail(err) {
+        var status = err && (err.status || (err.responseJSON && err.responseJSON.status) || 0);
+        var msg =
+          (err && (err.responseText || (err.responseJSON && err.responseJSON.title) || err.decode_error || err.statusText || err.message)) ||
+          'Request failed';
+        if (status) msg += ' [HTTP ' + status + ']';
+        var e = new Error(msg);
+        e.status = status || 0;
+        reject(e);
+      }
+      if (net) {
+        net.timeout(HTTP_TIMEOUT_MS);
+        net.silent(url, ok, fail, postData, opts);
+      } else if (Lampa.Network && typeof Lampa.Network.silent === 'function') {
+        Lampa.Network.silent(url, ok, fail, postData, opts);
+      } else {
+        reject(new Error('No network'));
+      }
+    });
+  }
+
+  function qcInitiate() {
+    return qcHttp(
+      apiBase() + '/QuickConnect/Initiate',
+      null,
+      {
+        'X-Emby-Authorization': qcAuthHeader(),
+        'Content-Type': 'application/json',
+      }
+    );
+  }
+
+  function qcPoll(secret) {
+    return qcHttp(
+      apiBase() + '/QuickConnect/Connect?secret=' + encodeURIComponent(secret),
+      null,
+      null
+    );
+  }
+
+  function qcAuthenticate(secret) {
+    return qcHttp(
+      apiBase() + '/Users/AuthenticateWithQuickConnect',
+      JSON.stringify({ Secret: secret }),
+      { 'Content-Type': 'application/json' }
+    );
+  }
+
+  function qcFinalize(data) {
+    var token = data && data.AccessToken;
+    var user = data && data.User;
+    if (!token) return Promise.reject(new Error('No access token'));
+    try {
+      Lampa.Storage.set(STORAGE_PREFIX + 'Token', token);
+    } catch (e) { }
+    if (user && user.Id) {
+      try {
+        Lampa.Storage.set(STORAGE_PREFIX + 'UserId', String(user.Id));
+      } catch (e) { }
+    }
+    if (user && user.Name) {
+      try {
+        Lampa.Storage.set(STORAGE_PREFIX + 'UserName', String(user.Name));
+      } catch (e) { }
+    }
+    rememberAutoUser({ Name: user && user.Name, Id: user && user.Id });
+    return Promise.resolve(data);
+  }
+
+  function qcLogout(token) {
+    if (!token) return Promise.resolve();
+    return qcHttp(
+      apiBase() + '/Sessions/Logout',
+      null,
+      { 'X-Emby-Token': token }
+    ).catch(function () {
+      return null;
+    });
   }
 
   function canMSE(mime) {
@@ -10965,15 +11430,23 @@
       '.jellyfin-conn-dot--bad{background:#ff5252;box-shadow:0 0 .6em rgba(255,82,82,.7)}' +
       '.jellyfin-conn-dot--check{background:#ffb83d;box-shadow:0 0 .6em rgba(255,184,61,.7)}' +
       '.jellyfin-conn-dot--idle{background:#8a8a8a}' +
+      '.jellyfin-auth-hide{display:none!important}' +
       '.settings-input .simple-keyboard-buttons__del,.settings-input .simple-keyboard-buttons__reset{padding:.7em;font-size:1.2em;border-radius:.3em;cursor:pointer;color:#fff;background:rgba(255,255,255,.12)}' +
       '.settings-input .simple-keyboard-buttons__del:hover,.settings-input .simple-keyboard-buttons__reset:hover{background-color:#fff;color:#000}' +
       '.jellyfin-url-field{display:flex;align-items:center;gap:.6em;flex-wrap:wrap}' +
       '.jellyfin-url-status__dot{cursor:pointer;width:.8em;height:.8em;flex:0 0 auto}' +
-      '.jellyfin-conn-label{font-weight:700;font-size:1.02em;line-height:1.3}' +
-      '.jellyfin-conn-label--ok{color:#2ee86d}' +
-      '.jellyfin-conn-label--bad{color:#ff5252}' +
-      '.jellyfin-conn-label--check{color:#ffb83d}' +
-      '.jellyfin-conn-path{width:100%;font-size:.85em;opacity:.6;word-break:break-all}' +
+      '.jellyfin-qc{text-align:center;padding:.5em 0}' +
+      '.jellyfin-qc-codebox{margin:.4em 0 .2em}' +
+      '.jellyfin-qc-code{' +
+      'display:inline-block;font-size:3.2em;font-weight:700;letter-spacing:.5em;' +
+      'color:#fff;background:rgba(255,255,255,.08);border-radius:.35em;padding:.2em .55em .2em .9em;' +
+      'text-align:center;font-variant-numeric:tabular-nums}' +
+      '.jellyfin-qc-help{font-size:.9em;opacity:.75;line-height:1.45;margin:0 0 .6em}' +
+      '.jellyfin-qc-status{font-size:.95em;color:#ffb83d;min-height:1.4em}' +
+      '.jellyfin-qc-footer{margin-top:.7em}' +
+      '.jellyfin-qc-disconnect{display:inline-block;padding:.5em 1.2em;border-radius:.3em;cursor:pointer;color:#fff;background:rgba(255,82,82,.25);border:1px solid rgba(255,82,82,.4);font-size:.92em}' +
+      '.jellyfin-qc-disconnect:hover{background:rgba(255,82,82,.45)}' +
+      '.jellyfin-qc-disconnect--busy{opacity:.55;pointer-events:none}' +
       '.jellyfin-hub .items-line--jf-stats{min-height:0!important;padding-bottom:1em}' +
       '.jellyfin-hub .items-line{padding-bottom:1em}' +
       '.jellyfin-hub .items-line--type-cards{min-height:0}' +
@@ -11344,12 +11817,36 @@
     fieldDefaults[STORAGE_PREFIX + 'Url'] = DEFAULT_URL;
     fieldDefaults[STORAGE_PREFIX + 'Key'] = DEFAULT_API_KEY;
 
+    function inputFlags(name) {
+      var secret = name === STORAGE_PREFIX + 'Key' || name === STORAGE_PREFIX + 'Password';
+      var managed =
+        secret ||
+        name === STORAGE_PREFIX + 'Login' ||
+        name === STORAGE_PREFIX + 'Url' ||
+        Object.prototype.hasOwnProperty.call(fieldDefaults, name);
+      return { secret: secret, managed: managed };
+    }
+
     var origEdit = Lampa.Input.edit;
 
-    Lampa.Input.edit = function (params, call) {
-      if (!params || !Object.prototype.hasOwnProperty.call(fieldDefaults, String(params.name || ''))) {
-        return origEdit(params, call);
+    function credentialLocked(name0) {
+      if (isLoggedIn() && (name0 === STORAGE_PREFIX + 'Login' || name0 === STORAGE_PREFIX + 'Password')) {
+        if (typeof Lampa.Noty !== 'undefined' && typeof Lampa.Noty.show === 'function') {
+          Lampa.Noty.show(Lampa.Lang.translate('jellyfin_creds_locked'));
+        }
+        return true;
       }
+      return false;
+    }
+
+    Lampa.Input.edit = function (params, call) {
+      if (!params) return origEdit(params, call);
+      var name0 = String(params.name || '');
+      var flags = inputFlags(name0);
+      if (!flags.managed) return origEdit(params, call);
+      if (credentialLocked(name0)) return null;
+
+      if (flags.secret && !params.password) params.password = true;
 
       var saveAllowed = true;
       var wrappedCall = function (value) {
@@ -11357,7 +11854,7 @@
           saveAllowed = true;
           return;
         }
-        if (typeof call === 'function') call(value);
+        if (typeof call === 'function') call(jellyfinCleanInput(value));
       };
 
       var kb;
@@ -11367,6 +11864,13 @@
         return origEdit(params, call);
       }
       if (!kb) return kb;
+
+      if (flags.secret) {
+        var $native = $('.settings-input').last().find('.simple-keyboard-input, #orsay-keyboard');
+        if ($native.length && $native[0].tagName.toLowerCase() === 'input') {
+          $native.attr('type', 'password');
+        }
+      }
 
       var $buttons = $('.settings-input').last().find('.simple-keyboard-buttons');
       var $cancel = $buttons.find('.simple-keyboard-buttons__cancel');
@@ -11381,12 +11885,15 @@
         if (kb.listener) kb.listener.send('enter');
       });
 
-      var $reset = $('<div class="simple-keyboard-buttons__reset">' +
-        String(Lampa.Lang.translate('jellyfin_reset') || 'Сбросить') + '</div>');
-      $reset.on('click', function () {
-        kb.value(fieldDefaults[name]);
-        if (kb.listener) kb.listener.send('enter');
-      });
+      var $reset = null;
+      if (Object.prototype.hasOwnProperty.call(fieldDefaults, name)) {
+        $reset = $('<div class="simple-keyboard-buttons__reset">' +
+          String(Lampa.Lang.translate('jellyfin_reset') || 'Сбросить') + '</div>');
+        $reset.on('click', function () {
+          kb.value(fieldDefaults[name]);
+          if (kb.listener) kb.listener.send('enter');
+        });
+      }
 
       $cancel.off('click').on('click', function () {
         saveAllowed = false;
@@ -11394,7 +11901,7 @@
       });
 
       $del.insertBefore($cancel);
-      $reset.insertBefore($cancel);
+      if ($reset) $reset.insertBefore($cancel);
 
       return kb;
     };
@@ -11811,32 +12318,274 @@
         state === 'check' ? 'jellyfin-conn-dot--check' :
         'jellyfin-conn-dot--idle'
       );
+      syncLoginLogoutRow();
     } catch (e) { }
+  }
+
+  function jellyfinSecretMask(len) {
+    var m = '';
+    while (len > 0) {
+      m += '*';
+      len--;
+    }
+    return m;
+  }
+
+  function maskJellyfinSecretRow(item, name) {
+    if (!item || !item[0]) return;
+    var $val = $(item).find('.settings-param__value');
+    function applyMask() {
+      if (!$val.length) return;
+      var raw = '';
+      try {
+        raw = String(Lampa.Storage.get(name) || '');
+      } catch (e) { }
+      var mask = jellyfinSecretMask(raw.length);
+      if ($val.text() !== mask) $val.text(mask);
+    }
+    if (!item[0]._jfMaskObs) {
+      item[0]._jfMaskObs = new MutationObserver(applyMask);
+      item[0]._jfMaskObs.observe(item[0], { childList: true, characterData: true, subtree: true });
+    }
+    applyMask();
+  }
+
+  function testJellyfinSystemInfo() {
+    if (jellyfinConnCheckBusy) return;
+    jellyfinConnCheckBusy = true;
+    jellyfinUrlConnState = 'check';
+    paintJellyfinConnDot('check');
+    jfHttp('/System/Info', { cache: false, timeout: 8000 })
+      .then(function () {
+        jellyfinUrlConnState = 'ok';
+        paintJellyfinConnDot('ok');
+      })
+      .catch(function (err2) {
+        jellyfinUrlConnState = 'bad';
+        paintJellyfinConnDot('bad');
+        var badStatus = err2 && parseInt(err2.status, 10) === 401;
+        try {
+          if (badStatus && authMode() === 'qc' && storedToken()) {
+            console.log('Jellyfin stale QC token detected, requiring re-auth');
+            storageClear('Token');
+            jellyfinUrlConnState = 'idle';
+            paintJellyfinConnDot('idle');
+            if (typeof Lampa.Noty !== 'undefined' && typeof Lampa.Noty.show === 'function') {
+              setTimeout(function () {
+                Lampa.Noty.show(Lampa.Lang.translate('jellyfin_qc_reauth'));
+              }, 600);
+            }
+            return;
+          }
+          console.log('Jellyfin /System/Info error:', err2 && err2.message);
+          if (typeof Lampa.Noty !== 'undefined' && typeof Lampa.Noty.show === 'function') {
+            setTimeout(function () {
+              Lampa.Noty.show((err2 && err2.message) || 'Server check failed');
+            }, 300);
+          }
+          if (badStatus && authMode() === 'login' && storedToken()) {
+            console.log('Jellyfin session revoked on server, logging out locally');
+            invalidateAuth();
+            invalidateUserCache();
+            syncUserInfoField();
+            jellyfinUrlConnState = 'idle';
+            paintJellyfinConnDot('idle');
+            if (typeof Lampa.Noty !== 'undefined' && typeof Lampa.Noty.show === 'function') {
+              setTimeout(function () {
+                Lampa.Noty.show(Lampa.Lang.translate('jellyfin_session_expired'));
+              }, 600);
+            }
+            return;
+          }
+        } catch (e) { }
+      })
+      .finally(function () {
+        jellyfinConnCheckBusy = false;
+      });
+  }
+
+  function stopQcPolling() {
+    if (qcPollTimer) {
+      clearTimeout(qcPollTimer);
+      qcPollTimer = null;
+    }
+  }
+
+  function startQuickConnect() {
+    var ctl = enabledControllerName('settings');
+    if (qcModalOpen) return;
+    if (!apiBase()) {
+      showJellyfinNoty('Jellyfin: ' + Lampa.Lang.translate('jellyfin_conn_url_empty'));
+      return;
+    }
+    qcModalOpen = true;
+    stopQcPolling();
+
+    var $code = $('<span class="jellyfin-qc-code"></span>');
+    var $status = $('<div class="jellyfin-qc-status"></div>').text(Lampa.Lang.translate('jellyfin_qc_waiting'));
+    var $disconnect = $('<div class="jellyfin-qc-disconnect"></div>').text(Lampa.Lang.translate('jellyfin_qc_disconnect'));
+    var $footer = $('<div class="jellyfin-qc-footer"></div>').append($disconnect);
+    var modal = $(
+      '<div class="jellyfin-qc">' +
+        '<div class="jellyfin-qc-codebox"></div>' +
+        '<div class="jellyfin-qc-help"></div>' +
+        '<div class="jellyfin-qc-statusbox"></div>' +
+        '</div>'
+    );
+    modal.find('.jellyfin-qc-codebox').append($code);
+    modal.find('.jellyfin-qc-help').text(Lampa.Lang.translate('jellyfin_qc_enter_code'));
+    modal.find('.jellyfin-qc-statusbox').append($status).after($footer);
+
+    var currentToken = storedToken();
+    if (!currentToken) $footer.hide();
+
+    $disconnect.on('click.jellyfin_qc', function () {
+      if ($disconnect.hasClass('jellyfin-qc-disconnect--busy')) return;
+      var tok = storedToken();
+      if (!tok) return;
+      $disconnect.addClass('jellyfin-qc-disconnect--busy');
+      $status.text(Lampa.Lang.translate('jellyfin_qc_disconnecting'));
+      qcLogout(tok)
+        .then(function () {
+          invalidateAuth();
+          invalidateUserCache();
+          syncUserInfoField();
+          jellyfinUrlConnState = 'idle';
+          paintJellyfinConnDot('idle');
+          try { Lampa.Settings.update(); } catch (e) { }
+          $status.text(Lampa.Lang.translate('jellyfin_qc_disconnected'));
+          $footer.hide();
+          setTimeout(ensureClosed, 1200);
+        })
+        .catch(function () {
+          invalidateAuth();
+          invalidateUserCache();
+          syncUserInfoField();
+          jellyfinUrlConnState = 'idle';
+          paintJellyfinConnDot('idle');
+          $status.text(Lampa.Lang.translate('jellyfin_qc_disconnected'));
+          $footer.hide();
+          setTimeout(ensureClosed, 1200);
+        });
+    });
+
+    function closeQc() {
+      stopQcPolling();
+      qcModalOpen = false;
+      if (typeof Lampa.Modal.close === 'function') Lampa.Modal.close();
+      deferControllerToggle(ctl);
+    }
+
+    var closed = false;
+    function ensureClosed() {
+      if (!closed) {
+        closed = true;
+        closeQc();
+      }
+    }
+
+    Lampa.Modal.open({
+      title: Lampa.Lang.translate('jellyfin_qc_code'),
+      html: modal,
+      size:
+        (typeof Lampa.Platform !== 'undefined' && Lampa.Platform.tv && Lampa.Platform.tv())
+          ? 'full'
+          : 'medium',
+      onBack: ensureClosed,
+    });
+
+    function poll(secret) {
+      if (!qcModalOpen) return;
+      stopQcPolling();
+      qcPoll(secret)
+        .then(function (res) {
+          if (!qcModalOpen) return;
+          if (res && res.Authenticated) {
+            $status.text(Lampa.Lang.translate('jellyfin_qc_success'));
+            qcAuthenticate(secret)
+              .then(function (authRes) {
+                if (!qcModalOpen) return;
+                return qcFinalize(authRes).then(function () {
+                  jellyfinUrlConnState = 'ok';
+                  paintJellyfinConnDot('ok');
+                  invalidateUserCache();
+                  syncUserInfoField();
+                  syncQcStartRow();
+                  try {
+                    Lampa.Settings.update();
+                  } catch (e) { }
+                  $footer.show();
+                  setTimeout(ensureClosed, 400);
+                });
+              })
+              .catch(function (e) {
+                if (!qcModalOpen) return;
+                $status.text((e && e.message) || Lampa.Lang.translate('jellyfin_qc_fail'));
+                qcPollTimer = setTimeout(function () { poll(secret); }, 3000);
+              });
+            return;
+          }
+          $status.text(Lampa.Lang.translate('jellyfin_qc_waiting'));
+          qcPollTimer = setTimeout(function () { poll(secret); }, 5000);
+        })
+        .catch(function (e) {
+          if (!qcModalOpen) return;
+          $status.text((e && e.message) || Lampa.Lang.translate('jellyfin_qc_expired'));
+          qcPollTimer = setTimeout(function () { poll(secret); }, 3000);
+        });
+    }
+
+    qcInitiate()
+      .then(function (res) {
+        if (!qcModalOpen) return;
+        if (!res || !res.Secret || !res.Code) {
+          $status.text(Lampa.Lang.translate('jellyfin_qc_fail'));
+          return;
+        }
+        $code.text(res.Code);
+        poll(res.Secret);
+      })
+      .catch(function (e) {
+        if (!qcModalOpen) return;
+        var is401 = parseInt(e && e.status, 10) === 401;
+        $status.text(
+          is401 ? Lampa.Lang.translate('jellyfin_qc_disabled')
+            : ((e && e.message) || Lampa.Lang.translate('jellyfin_qc_fail'))
+        );
+      });
   }
 
   function checkJellyfinConnection() {
     try {
-      if (!apiBase() || !apiKey()) {
+      if (!apiBase()) {
         jellyfinUrlConnState = 'idle';
         paintJellyfinConnDot('idle');
         return;
       }
-      if (jellyfinConnCheckBusy) return;
-      jellyfinConnCheckBusy = true;
-      jellyfinUrlConnState = 'check';
-      paintJellyfinConnDot('check');
-      jfHttp('/System/Info', { cache: false, timeout: 8000 })
-        .then(function () {
-          jellyfinUrlConnState = 'ok';
-          paintJellyfinConnDot('ok');
-        })
-        .catch(function () {
-          jellyfinUrlConnState = 'bad';
-          paintJellyfinConnDot('bad');
-        })
-        .finally(function () {
-          jellyfinConnCheckBusy = false;
-        });
+      if (authMode() === 'qc') {
+        if (!storedToken()) {
+          jellyfinUrlConnState = 'idle';
+          paintJellyfinConnDot('idle');
+          return;
+        }
+        testJellyfinSystemInfo();
+        return;
+      }
+      if (authMode() === 'login') {
+        if (storedToken()) {
+          testJellyfinSystemInfo();
+          return;
+        }
+        jellyfinUrlConnState = 'idle';
+        paintJellyfinConnDot('idle');
+        return;
+      }
+      if (!hasApiKey()) {
+        jellyfinUrlConnState = 'idle';
+        paintJellyfinConnDot('idle');
+        return;
+      }
+      testJellyfinSystemInfo();
     } catch (e) { }
   }
 
@@ -11932,6 +12681,7 @@
       addLabel(Lampa.Lang.translate('jellyfin_about_name'), MANIFEST.name);
       addLabel(Lampa.Lang.translate('jellyfin_about_version'), MANIFEST.version);
       addLabel(Lampa.Lang.translate('jellyfin_about_author'), MANIFEST.author);
+      addLabel('Build', JELLYFIN_BUILD);
 
       Lampa.Modal.open({
         title: Lampa.Lang.translate('jellyfin_about'),
@@ -11950,6 +12700,42 @@
     if (Lampa.Params && Lampa.Params.defaults) {
       Lampa.Params.defaults[STORAGE_PREFIX + 'Url'] = '';
       Lampa.Params.defaults[STORAGE_PREFIX + 'Key'] = '';
+      Lampa.Params.defaults[STORAGE_PREFIX + 'AuthMode'] = 'api';
+      Lampa.Params.defaults[STORAGE_PREFIX + 'Login'] = '';
+      Lampa.Params.defaults[STORAGE_PREFIX + 'Password'] = '';
+    }
+
+    function applyAuthRow(row, wanted) {
+      try {
+        if (!row) return;
+        var show = authMode() === wanted;
+        if (typeof row.toggleClass === 'function') {
+          row.toggleClass('jellyfin-auth-hide', !show);
+        } else if (typeof row.addClass === 'function') {
+          row.addClass('jellyfin-auth-hide');
+        }
+      } catch (e) { }
+    }
+
+    function applyAuthRows(mode) {
+      try {
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'Key"]'), 'api');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'Login"]'), 'login');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'Password"]'), 'login');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'LoginLogout"]'), 'login');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'PickUser"]'), 'api');
+        applyAuthRow($('[data-name="' + STORAGE_PREFIX + 'QcStart"]'), 'qc');
+      } catch (e) { }
+    }
+
+    function onCredentialChange() {
+      invalidateAuth();
+      invalidateUserCache();
+      jellyfinUrlConnState = '';
+      try {
+        Lampa.Settings.update();
+      } catch (e) { }
+      syncUserInfoField();
     }
 
     function registerApiParams(component) {
@@ -12003,6 +12789,7 @@
           }
         },
         onChange: function () {
+          invalidateAuth();
           invalidateUserCache();
           prefetchAutoUser();
           jellyfinUrlConnState = '';
@@ -12014,19 +12801,29 @@
 
       Lampa.SettingsApi.addParam({
         component: component,
-        param: { type: 'button', name: STORAGE_PREFIX + 'PickUser' },
-        field: {
-          name: Lampa.Lang.translate('jellyfin_user_pick'),
-          description: currentUserLabel(),
+        param: {
+          name: STORAGE_PREFIX + 'AuthMode',
+          type: 'select',
+          default: 'api',
+          values: {
+            login: Lampa.Lang.translate('jellyfin_auth_mode_login'),
+            qc: Lampa.Lang.translate('jellyfin_auth_mode_qc'),
+            api: Lampa.Lang.translate('jellyfin_auth_mode_api'),
+          },
         },
-        onRender: function (item) {
-          var $descr = $(item).find('.settings-param__descr');
-          if ($descr.length) $descr.text(currentUserLabel());
+        field: { name: Lampa.Lang.translate('jellyfin_auth_mode') },
+        onRender: function () {
+          applyAuthRows();
         },
-        onChange: function () {
-          pickUserFromList(function () {
+        onChange: function (value) {
+          invalidateAuth();
+          invalidateUserCache();
+          applyAuthRows(value);
+          try {
             Lampa.Settings.update();
-          });
+          } catch (e) { }
+          syncUserInfoField();
+          checkJellyfinConnection();
         },
       });
 
@@ -12040,6 +12837,10 @@
           placeholder: '',
         },
         field: { name: Lampa.Lang.translate('jellyfin_key') },
+        onRender: function (item) {
+          applyAuthRow(item, 'api');
+          maskJellyfinSecretRow(item, STORAGE_PREFIX + 'Key');
+        },
         onChange: function () {
           invalidateUserCache();
           prefetchAutoUser();
@@ -12048,18 +12849,107 @@
           checkJellyfinConnection();
         },
       });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: {
+          name: STORAGE_PREFIX + 'Login',
+          type: 'input',
+          default: '',
+          values: '',
+          placeholder: '',
+        },
+        field: { name: Lampa.Lang.translate('jellyfin_login') },
+        onRender: function (item) {
+          applyAuthRow(item, 'login');
+        },
+        onChange: function () {
+          onCredentialChange();
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: {
+          name: STORAGE_PREFIX + 'Password',
+          type: 'input',
+          default: '',
+          values: '',
+          placeholder: '',
+        },
+        field: { name: Lampa.Lang.translate('jellyfin_password') },
+        onRender: function (item) {
+          applyAuthRow(item, 'login');
+          maskJellyfinSecretRow(item, STORAGE_PREFIX + 'Password');
+        },
+        onChange: function () {
+          onCredentialChange();
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'button', name: STORAGE_PREFIX + 'LoginLogout' },
+        field: {
+          name: Lampa.Lang.translate('jellyfin_login_btn'),
+          description: ' ',
+        },
+        onRender: function (item) {
+          applyAuthRow(item, 'login');
+          syncLoginLogoutRow(item);
+        },
+        onChange: function () {
+          if (isLoggedIn()) {
+            disconnectSession();
+          } else {
+            loginToSession();
+          }
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'button', name: STORAGE_PREFIX + 'PickUser' },
+        field: {
+          name: Lampa.Lang.translate('jellyfin_user_pick'),
+          description: currentUserLabel(),
+        },
+        onRender: function (item) {
+          applyAuthRow(item, 'api');
+          var $descr = $(item).find('.settings-param__descr');
+          if ($descr.length) $descr.text(currentUserLabel());
+        },
+        onChange: function () {
+          pickUserFromList(function () {
+            Lampa.Settings.update();
+          });
+        },
+      });
+
+      Lampa.SettingsApi.addParam({
+        component: component,
+        param: { type: 'button', name: STORAGE_PREFIX + 'QcStart' },
+        field: { name: Lampa.Lang.translate('jellyfin_qc_start_btn') },
+        onRender: function (item) {
+          applyAuthRow(item, 'qc');
+          syncQcStartRow(item);
+        },
+        onChange: function () {
+          if (isLoggedIn()) {
+            syncQcStartRow();
+            disconnectSession();
+          } else {
+            startQuickConnect();
+          }
+        },
+      });
+
     }
 
     if (typeof Lampa.Settings.create === 'function') {
       Lampa.Template.add('settings_' + API_COMPONENT, '<div></div>');
 
       registerApiParams(API_COMPONENT);
-
-      Lampa.SettingsApi.addParam({
-        component: API_COMPONENT,
-        param: { name: STORAGE_PREFIX + 'ApiHint', type: 'static' },
-        field: { name: Lampa.Lang.translate('jellyfin_set_api_hint') },
-      });
 
       Lampa.SettingsApi.addParam({
         component: SETTINGS_COMPONENT,
@@ -12077,12 +12967,6 @@
     }
 
     registerApiParams(SETTINGS_COMPONENT);
-
-    Lampa.SettingsApi.addParam({
-      component: SETTINGS_COMPONENT,
-      param: { name: STORAGE_PREFIX + 'ApiHint', type: 'static' },
-      field: { name: Lampa.Lang.translate('jellyfin_set_api_hint') },
-    });
   }
 
   function addCategoriesSettings() {
@@ -13913,6 +14797,8 @@
     if (initDone) return;
     initDone = true;
     if (window.lampa_settings && window.lampa_settings.read_only) return;
+
+    try { console.log('[Jellyfin] build ' + JELLYFIN_BUILD + ' initialized'); } catch (e) { }
 
     addLang();
     patchQualityToText();
