@@ -4,7 +4,7 @@
   if (window.__jellyfinPlugin_loaded) return;
   window.__jellyfinPlugin_loaded = true;
 
-  var JELLYFIN_BUILD = 'Beta 17 (20260831)';
+  var JELLYFIN_BUILD = 'Beta 18 (20260831)';
 
   var STORAGE_PREFIX = 'jellyfin';
   var SETTINGS_COMPONENT = STORAGE_PREFIX;
@@ -15,7 +15,6 @@
   var BUTTONS_COMPONENT = STORAGE_PREFIX + 'Buttons';
   var CATALOG_COMPONENT = STORAGE_PREFIX + 'Catalog';
   var PLAYBACK_COMPONENT = STORAGE_PREFIX + 'Playback';
-  var SYNC_COMPONENT = STORAGE_PREFIX + 'Sync';
   var TRANSCODE_COMPONENT = STORAGE_PREFIX + 'Transcode';
   var AUDIO_COMPONENT = STORAGE_PREFIX + 'Audio';
   var QUALITY_COMPONENT = STORAGE_PREFIX + 'Quality';
@@ -36,14 +35,6 @@
   var TMDB_ENRICH_CONCURRENCY = 8;
   var PAGE_SIZE = 48;
   var IMG_PLACEHOLDER = './img/img_load.svg';
-  var RT_UI_TICK_MS = 250;
-  var RT_TIMELINE_MS = 3000;
-  var RT_NET_INTERVAL_MS = 250;
-  var TMDB_MIRROR_INTERVAL_MS = 3000;
-  var TMDB_SESSION_INTERVAL_MS = 3000;
-  var TMDB_GUARD_RETAIN_MS = 15000;
-  var TMDB_PUSH_DEDUP_MS = 60000;
-  var EXTERNAL_TICKER_MS = 250;
   var API_CACHE_TTL_MS = 30 * 60 * 1000;
   var API_USERDATA_TTL_MS = 3 * 60 * 1000;
   var API_LATEST_TTL_MS = 5 * 60 * 1000;
@@ -140,45 +131,24 @@
   var libraryIndexInflight = null;
   var hubDataInflight = null;
   var hubRefreshTimer = null;
-  var LOCAL_PROGRESS_KEY = STORAGE_PREFIX + 'Progress';
-  var LOCAL_PROGRESS_TTL_MS = 90 * 24 * 60 * 60 * 1000;
-  var localProgressCache = null;
   var currentPlaySessionId = '';
   var activePlaySessionIds = {};
   var currentAudioStreamIndex = null;
   var playlistItems = [];
   var playlistBuild = null;
   var currentPlayItemId = null;
-  var currentTimelineHash = null;
   var currentPlayRow = null;
-  var lastCompletedRowId = null;
-  var lastProgressResetRowId = null;
-  var lastProgressResetTimer = null;
   var lastLivePlaylistId = null;
   var playlistLiveRows = {};
   var playlistLiveTimer = null;
   var playlistFocusedRow = null;
   var playlistRingFocused = false;
   var playlistKeyHandlerAttached = false;
-  var lastPlaybackState = null;
   var externalPlay = null;
-  var externalPlayTicker = null;
-  var syncingTimelineHash = '';
-  var rtLastUiAt = 0;
-  var rtLastTimelineAt = 0;
-  var rtLastNetAt = 0;
-  var rtNetTimer = null;
-  var rtIsPaused = false;
-  var rtPlayerVideoHooked = false;
   var externalPausedTotalMs = 0;
   var externalPausedAt = 0;
-
-  function rtCancelPendingNet() {
-    if (rtNetTimer) {
-      clearTimeout(rtNetTimer);
-      rtNetTimer = null;
-    }
-  }
+  var playbackTimelineRegistered = false;
+  var lastProgressWriteAt = 0;
 
   function secondsToTicks(sec) {
     return Math.round(Math.max(0, Number(sec) || 0) * 10000000);
@@ -289,14 +259,6 @@
       jellyfin_set_tap_play: {
         en: 'Tap card to play (long = menu)',
         ru: 'Нажатие — смотреть (долгое — меню)',
-      },
-      jellyfin_set_sync_watched: {
-        en: 'Sync watched status with TMDB cards',
-        ru: 'Синхронизировать «просмотрено» с карточками TMDB',
-      },
-      jellyfin_set_sync_watched_hint: {
-        en: 'Watched/unwatched state syncs both ways between Jellyfin and TMDB cards in Lampa (matched by TMDB id)',
-        ru: 'Статус «просмотрено» синхронизируется в обе стороны между Jellyfin и карточками TMDB в Lampa (по TMDB id)',
       },
       jellyfin_set_transcode: {
         en: 'HLS transcoding (Lampa player)',
@@ -464,10 +426,6 @@
       jellyfin_set_playback_group: {
         en: 'Playback',
         ru: 'Воспроизведение',
-      },
-      jellyfin_set_sync_group: {
-        en: 'Synchronization',
-        ru: 'Синхронизация',
       },
       jellyfin_set_transcoding_group: {
         en: 'Transcoding',
@@ -1594,23 +1552,115 @@
     });
   }
 
+  function reportRowUpdated(row) {
+    try {
+      Lampa.Listener.send('jellyfin:row-updated', { row: row });
+    } catch (e) { }
+  }
+
+  function jfWriteUserData(row, rowId, state) {
+    rowId = String(rowId || (row && row.id) || (row && row.raw && row.raw.Id) || '');
+    if (!rowId) return;
+    var st = state || {};
+    var pct = Math.min(100, Math.max(0, Number(st.pct) || 0));
+    var t = Math.max(0, Number(st.time) || 0);
+    var played = !!st.played;
+    var durSec = Math.max(0, Number(st.dur) || 0);
+    var p = played
+      ? 100
+      : durSec > 0
+        ? Math.min(100, Math.round((t / durSec) * 100))
+        : Math.min(100, Math.max(0, pct));
+
+    var doWrite = function (uid) {
+      if (!uid) return;
+      jfHttp(
+        '/Users/' + encodeURIComponent(uid) + '/Items/' + encodeURIComponent(rowId) + '/UserData',
+        {
+          method: 'POST',
+          jsonBody: {
+            Played: played,
+            PlayedPercentage: Math.round(p * 10) / 10,
+            PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
+            LastPlayedDate: new Date().toISOString(),
+          },
+        }
+      ).catch(function () { });
+      if (row) {
+        row.watched = played;
+        row.playedPct = p;
+        row.resumeSec = played ? 0 : t;
+      }
+      try {
+        row.raw.UserData = row.raw.UserData || {};
+        row.raw.UserData.Played = played;
+        row.raw.UserData.PlayedPercentage = Math.round(p * 10) / 10;
+        row.raw.UserData.PlaybackPositionTicks = played ? 0 : secondsToTicks(t);
+      } catch (e) { }
+      reportRowUpdated(row);
+    };
+
+    var uid = storedUserId() || cachedUserId;
+    if (uid) {
+      doWrite(uid);
+    } else {
+      resolveUserId().then(function (u) {
+        doWrite(u);
+      }).catch(function () { });
+    }
+  }
+
+  function reportPlaybackProgress(row, percent, timeSec, durationSec) {
+    var now = Date.now();
+    if (now - lastProgressWriteAt < 5000) return;
+    lastProgressWriteAt = now;
+    var pct = Number(percent) || 0;
+    var played = pct >= 90;
+    jfWriteUserData(row, row.id, {
+      pct: pct,
+      time: Number(timeSec) || 0,
+      dur: Number(durationSec) || 0,
+      played: played,
+    });
+  }
+
+  function registerTimelineListener() {
+    if (playbackTimelineRegistered) return;
+    playbackTimelineRegistered = true;
+    try {
+      Lampa.Timeline.listener.follow('update', function (e) {
+        if (!e || !e.data) return;
+        var hash = String(e.data.hash || '');
+        var row = currentPlayRow;
+        if (!row) return;
+        var expected = '';
+        try {
+          expected = timelineHashFor(row);
+        } catch (err) { }
+        if (expected && hash !== expected) return;
+        var road = e.data.road || {};
+        reportPlaybackProgress(row, road.percent, road.time, road.duration);
+      });
+    } catch (e) { }
+  }
+
+  function markPlaybackFinished() {
+    try {
+      var row = currentPlayRow;
+      if (!row) return;
+      if (row.type === 'Movie' || row.type === 'Episode') {
+        jfWriteUserData(row, row.id, { pct: 100, time: 0, dur: 0, played: true });
+      }
+    } catch (e) { }
+  }
+
   function handlePlayerDestroy() {
-    stopExternalPlaybackTicker();
-    terminateJfPlayback();
-    flushPlaylistProgress();
     invalidateUserDataCaches();
     scheduleHubRefresh();
     externalPlay = null;
     resetExternalPauseTracking();
-    rtIsPaused = false;
-    tmdbSync.sessionPaused = false;
-    try {
-      tmdbSyncStopSession();
-    } catch (e) { }
-    tmdbSyncClearJfMirror();
     currentAudioStreamIndex = null;
     currentPlayItemId = null;
-    currentTimelineHash = null;
     currentPlayRow = null;
     autoQualityStop();
     if (autoQuality) {
@@ -1633,7 +1683,6 @@
         try {
           Lampa.Listener.send('jellyfin:hub-refresh', {});
         } catch (e) { }
-        scheduleTmdbSyncFromLibrary();
       }, 1500);
     } catch (e) { }
   }
@@ -2256,18 +2305,33 @@
     });
   }
 
-  function timelineHashFor(row) {
-    var id = row && row.raw && row.raw.Id;
-    if (!id) return '';
-    var s = 'jellyfin:' + String(id);
+  function timelineHashText(s) {
     if (Lampa.Utils && typeof Lampa.Utils.hash === 'function') {
-      return 'jf' + Lampa.Utils.hash(s);
+      return Lampa.Utils.hash(String(s));
     }
+    var str = String(s || '');
     var h = 0;
-    for (var i = 0; i < s.length; i++) {
-      h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    for (var i = 0; i < str.length; i++) {
+      h = ((h << 5) - h + str.charCodeAt(i)) | 0;
     }
-    return 'jf' + (h >>> 0);
+    return String(Math.abs(h));
+  }
+
+  function timelineHashFor(row) {
+    var raw = (row && row.raw) || {};
+    var type = row && row.type ? String(row.type) : String(raw.Type || '');
+    if (type === 'Episode') {
+      var en = episodeNumbers(raw);
+      var season = en.season;
+      var episode = en.episode;
+      var seriesName = cleanJellyfinName(raw.SeriesName) || (row && row.title) || '';
+      return timelineHashText([season, season > 10 ? ':' : '', episode, seriesName].join(''));
+    }
+    if (type === 'Series' || type === 'Season') {
+      return timelineHashText(cleanJellyfinName(raw.Name) || (row && row.title) || '');
+    }
+    var name = cleanJellyfinName(raw.OriginalTitle || raw.Name) || (row && row.title) || '';
+    return timelineHashText(name);
   }
 
   function playItemFromRow(row, userId, includeMovie, opts) {
@@ -2288,10 +2352,9 @@
       format: format,
       qualityPreset: opts.qualityPreset || defaultKey,
     };
-    if (playTarget.resumeSec > 0) {
-      streamOpts.startTicks = Math.round(Number(playTarget.resumeSec) * 10000000);
-    }
     if (opts.forceTranscode) streamOpts.forceTranscode = true;
+    var resumeSec = row.type === 'Audio' ? 0 : Math.max(0, Number(row.resumeSec) || 0);
+    if (resumeSec > 0) streamOpts.startTicks = secondsToTicks(resumeSec);
     if (currentAudioStreamIndex !== null && currentAudioStreamIndex !== undefined && currentAudioStreamIndex !== -1) {
       streamOpts.audioStreamIndex = currentAudioStreamIndex;
     }
@@ -2308,19 +2371,18 @@
           : streamUrl(playTarget.id, streamOpts),
     };
     if (row.type === 'Movie' || row.type === 'Episode') {
-      item.timeline = {
-        hash: timelineHashFor(row),
-        time: playTarget.resumeSec,
-        duration: 0,
-        percent: 0,
-        handler: function (percent, time, duration) {
-          reportPlaybackProgress(row, percent, time, duration);
-        },
-      };
-    } else if (playTarget.resumeSec > 0) {
+      var tlHash = '';
+      try { tlHash = timelineHashFor(row); } catch (e) { }
+      seedTimelineFromRow(row);
+      if (tlHash) {
+        item.timeline = Lampa.Timeline.view(tlHash);
+      } else {
+        item.timeline = { hash: '', time: resumeSec, duration: 0, percent: 0 };
+      }
+    } else {
       item.timeline = includeMovie
-        ? { time: playTarget.resumeSec, duration: 0, percent: 0 }
-        : { time: playTarget.resumeSec };
+        ? { time: resumeSec, duration: 0, percent: 0 }
+        : { time: resumeSec };
     }
     if (qualityMap) {
       var lampaDefaultUrl = '';
@@ -2358,10 +2420,6 @@
     var raw = row.raw || {};
     var pct = Number(row.playedPct) || 0;
     if (row.watched && pct < 100) pct = 100;
-    if (!pct && !row.watched) {
-      var local = readLocalProgress(row.id);
-      if (local && local.pct > 0) pct = local.pct;
-    }
     return {
       id: row.id,
       code: episodeCode(raw),
@@ -2696,36 +2754,6 @@
         encodeURIComponent('MediaSources')
       );
     });
-  }
-
-  function fetchFreshResume(row) {
-    var id = row && row.raw && row.raw.Id;
-    if (!id) return Promise.resolve(row ? row.resumeSec : 0);
-    return resolveUserId()
-      .then(function (userId) {
-        return jfHttp(
-          '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(id),
-          { dataType: 'json', cache: false }
-        );
-      })
-      .then(function (item) {
-        var local = readLocalProgress(id);
-        if (item && item.UserData) {
-          var sec = ticksToSeconds(item.UserData.PlaybackPositionTicks);
-          if (item.UserData.Played) {
-            clearLocalProgress(id);
-            return 0;
-          }
-          if (localProgressIsNewer(local, item.UserData)) {
-            return local && local.played ? 0 : Number(local.time) || 0;
-          }
-          return sec > 0 ? sec : localResumeSec(id);
-        }
-        return localResumeSec(id);
-      })
-      .catch(function () {
-        return row ? row.resumeSec : 0;
-      });
   }
 
   function variantsFromItemDetails(item, row) {
@@ -3741,49 +3769,18 @@
     return s;
   }
 
-  function localResumeSec(itemId) {
-    var local = readLocalProgress(itemId);
-    if (local && !local.played && local.time > 0) return local.time;
-    return 0;
-  }
-
-  function localProgressIsNewer(local, userData) {
-    if (!local || !local.updatedAt) return false;
-    if (!userData || !userData.LastPlayedDate) return true;
-    var ud = Date.parse(userData.LastPlayedDate);
-    if (!isFinite(ud)) return true;
-    return local.updatedAt > ud;
-  }
-
   function mapRow(item, meta) {
     meta = meta || null;
     var tmdb = tmdbFromItem(item);
     var jellyPoster = posterUrl(item);
     var displayTitle = meta ? displayTitleFromMeta(item, meta) : cardTitle(item);
-    var localP = readLocalProgress(item.Id);
     var serverResumeSec = item.UserData ? ticksToSeconds(item.UserData.PlaybackPositionTicks) : 0;
     var serverPlayed = !!(item.UserData && item.UserData.Played);
-    var localNewer = localProgressIsNewer(localP, item.UserData);
     var resumeSec = serverResumeSec;
-    if (localNewer && localP.played) {
-      resumeSec = 0;
-    } else if (localNewer && Number(localP.time) > 0) {
-      resumeSec = Number(localP.time);
-    } else if (!resumeSec) {
-      if (serverPlayed) {
-        clearLocalProgress(item.Id);
-      } else {
-        resumeSec = localResumeSec(item.Id);
-      }
-    }
     var serverPct = item.UserData
       ? Number(item.UserData.PlayedPercentage) || (serverPlayed ? 100 : 0)
       : 0;
     var playedPct = serverPct;
-    if (localNewer && localP.played) playedPct = 100;
-    else if (!playedPct && resumeSec && resumeSec !== serverResumeSec) {
-      if (localP && !localP.played) playedPct = Number(localP.pct) || 0;
-    }
     return hydrateRowVariantsFromItem({
       id: item.Id,
       raw: item,
@@ -3807,7 +3804,7 @@
           : '',
       resumeSec: resumeSec,
       playedPct: playedPct,
-      watched: serverPlayed || !!(localP && localP.played),
+      watched: serverPlayed,
     });
   }
 
@@ -4357,6 +4354,7 @@
         hubLine: !!(ctx && ctx.compact),
         homeMedia: !!(ctx && ctx.homeMedia),
       });
+      injectCardProgress($card, updated);
       updateCardPoster($card, updated);
       $card.find('.card__title').text(ctx && ctx.compact ? hubCardTitle(updated) : updated.title);
       if (updated.year) $card.find('.card__age').text(updated.year);
@@ -4399,6 +4397,7 @@
       hubLine: !!(ctx && ctx.compact),
       homeMedia: !!(ctx && ctx.homeMedia),
     });
+    injectCardProgress($card, row);
     if (ctx && ctx.compact) applyHubCardMeta($card, row);
     bindJellyfinCard($card, row, ctx);
     if (ctx.cardsById) ctx.cardsById[String(row.id)] = { $card: $card, row: row };
@@ -5897,116 +5896,6 @@
     }, 10);
   }
 
-  function readLocalProgressMap() {
-    if (localProgressCache !== null) return localProgressCache;
-    localProgressCache = {};
-    try {
-      var raw = Lampa.Storage.get(LOCAL_PROGRESS_KEY, '');
-      var parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed === 'object') localProgressCache = parsed;
-    } catch (e) { }
-    return localProgressCache;
-  }
-
-  function saveLocalProgressMap() {
-    try {
-      Lampa.Storage.set(LOCAL_PROGRESS_KEY, JSON.stringify(localProgressCache));
-    } catch (e) { }
-  }
-
-  function readLocalProgress(itemId) {
-    var map = readLocalProgressMap();
-    var p = map[String(itemId)];
-    if (!p || !p.updatedAt) return null;
-    if (Date.now() - p.updatedAt > LOCAL_PROGRESS_TTL_MS) {
-      delete map[String(itemId)];
-      saveLocalProgressMap();
-      return null;
-    }
-    return p;
-  }
-
-  function writeLocalProgress(itemId, pct, timeSec, played) {
-    var map = readLocalProgressMap();
-    map[String(itemId)] = {
-      pct: Math.min(100, Math.max(0, Math.round(pct || 0))),
-      time: Math.max(0, timeSec || 0),
-      played: !!played,
-      updatedAt: Date.now(),
-    };
-    saveLocalProgressMap();
-  }
-
-  function clearLocalProgress(itemId) {
-    var map = readLocalProgressMap();
-    var key = String(itemId);
-    if (map[key]) {
-      delete map[key];
-      saveLocalProgressMap();
-    }
-  }
-
-  function syncExternalTimeline(row, resumeSec, durationSec) {
-    try {
-      if (!Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
-      if (!row || !row.raw || !row.raw.Id) return;
-      var hash = timelineHashFor(row);
-      if (!hash) return;
-      var dur = Math.max(0, Number(durationSec) || 0);
-      var t = Math.max(0, Number(resumeSec) || 0);
-      var pct = dur > 0 && t > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
-      syncingTimelineHash = hash;
-      Lampa.Timeline.update({
-        hash: hash,
-        percent: pct,
-        time: t,
-        duration: dur
-      });
-      syncingTimelineHash = '';
-    } catch (e) {
-      syncingTimelineHash = '';
-    }
-  }
-
-  function rowHasAnyProgress(row) {
-    if (!row) return false;
-    var ud = row.raw && row.raw.UserData ? row.raw.UserData : {};
-    return !!(
-      row.watched ||
-      Number(row.playedPct) > 0 ||
-      Number(row.resumeSec) > 0 ||
-      ud.Played ||
-      Number(ud.PlayedPercentage) > 0 ||
-      Number(ud.PlaybackPositionTicks) > 0
-    );
-  }
-
-  function syncResolvedHistory(row) {
-    if (!row || !apiBase() || !apiKey()) return Promise.resolve();
-    try {
-      if (!Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return Promise.resolve();
-    } catch (e) {
-      return Promise.resolve();
-    }
-    var isSeries =
-      row.type === 'Series' || (row.raw && row.raw.Type === 'Series');
-    if (!isSeries) {
-      if (rowHasAnyProgress(row)) {
-        syncExternalTimeline(row, row.resumeSec || 0, runtimeSecondsOf(row));
-      }
-      return Promise.resolve();
-    }
-    return fetchEpisodes(row.id)
-      .then(function (eps) {
-        (eps || []).forEach(function (ep) {
-          if (rowHasAnyProgress(ep)) {
-            syncExternalTimeline(ep, ep.resumeSec || 0, runtimeSecondsOf(ep));
-          }
-        });
-      })
-      .catch(function () { });
-  }
-
   function launchPlayerFromSelect(ctl, launch) {
     restoreControllerNow(ctl);
     launch();
@@ -6990,21 +6879,12 @@
     var row = findPlaybackRow(id);
     if (row) {
       currentPlayRow = row;
-      currentTimelineHash = timelineHashFor(row) || '';
       saveWatchTarget(row);
     }
     if (!row || !row.raw) return;
-    fetchFreshResume(row)
-      .then(function (resumeSec) {
-        if (!item || !item.timeline) return;
-        var sec = Number(resumeSec) || 0;
-        if (!(sec > 0)) return;
-        var dur = Math.round((Number(row.raw.RunTimeTicks) || 0) / 10000000) || 0;
-        item.timeline.time = sec;
-        item.timeline.duration = dur;
-        item.timeline.percent = dur > 0 ? Math.min(100, Math.round((sec / dur) * 100)) : 0;
-      })
-      .catch(function () { });
+    if (item && item.timeline) {
+      item.timeline.time = Math.max(0, Number(row.resumeSec) || 0);
+    }
   }
 
   function playRow(row, allRows, opts) {
@@ -7017,17 +6897,7 @@
     if (opts.qualityPreset) streamOpts.qualityPreset = opts.qualityPreset;
     var readyPromise = (
       row && row.variantsResolved ? Promise.resolve(row) : ensurePlaybackVariants(row)
-    ).then(function (r) {
-      if (!r || !r.raw || !r.raw.Id) return r;
-      return fetchFreshResume(r)
-        .then(function (resumeSec) {
-          r.resumeSec = resumeSec;
-          return r;
-        })
-        .then(function (rc) {
-          return tmdbSyncResolveResumeForLaunch(rc);
-        });
-    });
+    );
     var rowsPromise;
     if (allRows && allRows.length) {
       rowsPromise = Promise.resolve(allRows);
@@ -7088,37 +6958,24 @@
           }
           currentPlayRow = ready || null;
           if (ready) saveWatchTarget(ready);
-          if (ready && ready.raw && ready.raw.Id) {
-            if (!ready.resumeSec) clearLocalProgress(ready.raw.Id);
-            if (playItem && playItem.timeline) playItem.timeline.time = ready.resumeSec || 0;
-          }
-          currentTimelineHash =
-            (playItem && playItem.timeline && playItem.timeline.hash) || '';
           if (ready && ready.raw && ready.raw.Id && !usesLampaNativePlayer()) {
             externalPlay = {
               rowId: ready.raw.Id,
               type: String(ready.type || ready.raw.Type || ''),
               startAt: Date.now(),
-              resumeSec: Math.max(0, Number(ready.resumeSec) || 0),
+              resumeSec: Number(ready.resumeSec) || 0,
               durationSec: Math.round((Number(ready.raw.RunTimeTicks) || 0) / 10000000),
-              anchorTime: Math.max(0, Number(ready.resumeSec) || 0),
+              anchorTime: 0,
               anchorAt: Date.now(),
             };
-            cachePlaybackState(externalPlay.rowId, externalPlay.type, 0, externalPlay.resumeSec, externalPlay.durationSec);
-            startExternalPlaybackTicker();
           } else {
             externalPlay = null;
           }
-          if (ready && ready.raw && ready.raw.Id && !usesLampaNativePlayer()) {
-            syncExternalTimeline(
-              ready,
-              ready.resumeSec,
-              Math.round((Number(ready.raw.RunTimeTicks) || 0) / 10000000)
-            );
-          }
           if (ready && ready.raw && ready.raw.Id) {
-            rtIsPaused = false;
             resetExternalPauseTracking();
+          }
+          if (playItem && playItem.timeline && playItem.timeline.hash) {
+            try { Lampa.Timeline.update(playItem.timeline); } catch (e) { }
           }
           Lampa.Player.play(playItem);
         });
@@ -7152,337 +7009,9 @@
     }
   }
 
-  function applyLocalPlaybackState(row, played, pct, timeSec) {
-    if (!row.raw) row.raw = {};
-    if (!row.raw.UserData) row.raw.UserData = {};
-    var ud = row.raw.UserData;
-    ud.Played = !!played;
-    ud.PlayedPercentage = Math.round(pct * 10) / 10;
-    ud.PlaybackPositionTicks = Math.round((played ? 0 : timeSec) * 10000000);
-    row.watched = !!played;
-    row.playedPct = pct;
-    row.resumeSec = played ? 0 : timeSec;
-    try {
-      Lampa.Listener.send('jellyfin:row-updated', { row: row });
-    } catch (e) { }
-  }
-
-  function jfWriteUserData(row, rowId, state) {
-    rowId = String(rowId || (row && row.raw && row.raw.Id) || '');
-    if (!rowId) return;
-    var st = state || {};
-    var pct = Math.min(100, Math.max(0, Number(st.pct) || 0));
-    var t = Math.max(0, Number(st.time) || 0);
-    var played = !!st.played;
-    var durSec = Math.max(0, Number(st.dur) || 0);
-    var p = played
-      ? 100
-      : durSec > 0
-        ? Math.min(100, Math.round((t / durSec) * 100))
-        : Math.min(100, Math.max(0, pct));
-    var doWrite = function (userId) {
-      if (!userId) return;
-      syncPostJf(
-        '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(rowId) + '/UserData',
-        {
-          Played: played,
-          PlayedPercentage: Math.round(p * 10) / 10,
-          PlaybackPositionTicks: played ? 0 : secondsToTicks(t),
-          LastPlayedDate: new Date().toISOString(),
-        }
-      );
-      try {
-        writeLocalProgress(rowId, p, played ? 0 : t, played);
-      } catch (e) { }
-      if (row) applyLocalPlaybackState(row, played, p, t);
-    };
-    var userId = String(storedUserId() || cachedUserId || '').trim();
-    if (userId) {
-      doWrite(userId);
-    } else {
-      resolveUserId().then(function (uid) { doWrite(uid); }).catch(function () { });
-    }
-  }
-
-  function sendJfPlaybackProgress(row, rowId, pct, t, dur, played, force) {
-    jfWriteUserData(row, rowId, { pct: pct, time: t, dur: dur, played: played });
-  }
-
-  var lastSaveWarnAt = 0;
-  function warnSaveOnce(text) {
-    var now = Date.now();
-    if (now - lastSaveWarnAt < 15000) return;
-    lastSaveWarnAt = now;
-    try {
-      Lampa.Bell.push({ text: 'Jellyfin sync: ' + text });
-    } catch (e) { }
-  }
-
-  function jfPostUrl(path) {
-    var base = apiBase();
-    var key = apiKey();
-    if (!base || !key) return '';
-    return (
-      base +
-      path +
-      (path.indexOf('?') >= 0 ? '&' : '?') +
-      'api_key=' +
-      encodeURIComponent(key)
-    );
-  }
-
-  function postJfSync(url, payload, path) {
-    try {
-      if (!window.XMLHttpRequest) return false;
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', url, false);
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.send(payload);
-      if (xhr.status === 0) {
-        warnSaveOnce('запрос заблокирован браузером');
-        return false;
-      }
-      if (xhr.status >= 300) {
-        warnSaveOnce('HTTP ' + xhr.status + ' → ' + String(path).split('?')[0]);
-        return false;
-      }
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function postJfBeacon(url, payload) {
-    try {
-      if (navigator.sendBeacon && navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }))) {
-        return true;
-      }
-    } catch (e) { }
-    return false;
-  }
-
-  function syncPostJf(path, body) {
-    var url = jfPostUrl(path);
-    if (!url) {
-      warnSaveOnce('нет адреса сервера или API-ключа');
-      return false;
-    }
-    var payload = JSON.stringify(body);
-    if (postJfSync(url, payload, path)) return true;
-    return postJfBeacon(url, payload);
-  }
-
-  function syncPostJfUnload(path, body) {
-    return syncPostJf(path, body);
-  }
-
-  function terminateJfPlayback() {
-    rtCancelPendingNet();
-    try {
-      var row = currentPlayRow;
-      var rowId = (row && row.raw && String(row.raw.Id)) || (lastPlaybackState && lastPlaybackState.id) || '';
-      if (!rowId) return;
-      var type = '';
-      if (row && row.raw) type = String(row.type || row.raw.Type || '');
-      else if (lastPlaybackState) type = String(lastPlaybackState.type || '');
-      if (type && type !== 'Movie' && type !== 'Episode') return;
-      var state = readPlaybackState(row, rowId);
-      if (!state && externalPlay && String(externalPlay.rowId) === String(rowId)) {
-        state = externalPlaybackEstimate();
-      }
-      var t = 0;
-      var dur = 0;
-      var pct = 0;
-      if (state) {
-        t = Number(state.time) || 0;
-        dur = Number(state.duration) || 0;
-        pct = Number(state.pct) || 0;
-      } else {
-        return;
-      }
-      if (!pct && dur > 0 && t > 0) pct = Math.min(100, Math.round((t / dur) * 100));
-      if (dur > 0 && t > 0 && t >= dur - 15) pct = 100;
-      if (lastCompletedRowId && String(rowId) === String(lastCompletedRowId)) pct = 100;
-      var st = tmdbNormalizeState(pct, t, dur);
-      if (!st.played && st.pct < 5 && st.time < 10) return;
-      jfWriteUserData(row, rowId, { pct: st.pct, time: st.time, dur: st.duration, played: st.played });
-    } catch (e) { }
-  }
-
-  function isPluginVideoEl(target) {
-    if (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO') return false;
-    if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return false;
-    if (externalPlay && externalPlay.rowId) return false;
-    return true;
-  }
-
-  function handleRealtimeTime(cur, dur) {
-    if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return;
-    cur = Number(cur) || 0;
-    dur = Number(dur) || 0;
-    if (externalPlay && externalPlay.rowId && String(externalPlay.rowId) === String(currentPlayRow.raw.Id)) {
-      anchorExternalPosition(cur);
-      if (dur > 0) externalPlay.durationSec = dur;
-      var pd = externalPlay.durationSec || dur;
-      var pp = pd > 0 ? Math.min(100, Math.max(0, Math.round((cur / pd) * 100))) : 0;
-      reportPlaybackProgress(currentPlayRow, pp, cur, pd, { realtime: true });
-      return;
-    }
-    if (dur <= 0 || cur <= 0) return;
-    var pct = Math.min(100, Math.max(0, Math.round((cur / dur) * 100)));
-    reportPlaybackProgress(currentPlayRow, pct, cur, dur, { realtime: true });
-  }
-
-  function installRealtimeProgress() {
-    try {
-      if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener && !rtPlayerVideoHooked) {
-        Lampa.PlayerVideo.listener.follow('timeupdate', function (e) {
-          handleRealtimeTime(e && e.current, e && e.duration);
-        });
-        rtPlayerVideoHooked = true;
-      }
-    } catch (e) { }
-    if (!document.addEventListener || rtPlayerVideoHooked) return;
-    document.addEventListener(
-      'timeupdate',
-      function (ev) {
-        var v = ev && ev.target;
-        if (!isPluginVideoEl(v)) return;
-        handleRealtimeTime(v.currentTime, v.duration);
-      },
-      true
-    );
-  }
-
-  function handleMediaPause(ev) {
-    if (externalPlay && externalPlay.rowId) {
-      if (!externalPausedAt) {
-        externalPausedAt = Date.now();
-        var pstate = externalPlaybackEstimate();
-        if (pstate) anchorExternalPosition(pstate.time);
-        if (pstate && currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)) {
-          cachePlaybackState(externalPlay.rowId, externalPlay.type, pstate.pct, pstate.time, pstate.duration);
-          reportPlaybackProgress(currentPlayRow, pstate.pct, pstate.time, pstate.duration);
-        }
-      }
-      return;
-    }
-    if (!isPluginVideoEl(ev && ev.target)) return;
-    if (!currentPlayRow || !currentPlayRow.raw) return;
-    rtIsPaused = true;
-    var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
-    if (state) {
-      reportPlaybackProgress(
-        currentPlayRow,
-        state.pct,
-        state.time,
-        state.duration,
-        { force: true }
-      );
-    }
-  }
-
-  function handleMediaPlay(ev) {
-    if (externalPlay && externalPlay.rowId) {
-      if (externalPausedAt) {
-        externalPausedTotalMs += Date.now() - externalPausedAt;
-        externalPausedAt = 0;
-      }
-      return;
-    }
-    if (!isPluginVideoEl(ev && ev.target)) return;
-    if (!currentPlayRow || !currentPlayRow.raw) return;
-    rtIsPaused = false;
-    var state = readPlaybackState(currentPlayRow, currentPlayRow.raw.Id);
-    if (state) {
-      reportPlaybackProgress(
-        currentPlayRow,
-        state.pct,
-        state.time,
-        state.duration,
-        { force: true }
-      );
-    }
-  }
-
   function resetExternalPauseTracking() {
     externalPausedTotalMs = 0;
     externalPausedAt = 0;
-  }
-
-  function reportPlaybackProgress(row, percent, timeSec, durationSec, opts) {
-    opts = opts || {};
-    if (!row || !row.raw || !row.raw.Id) return;
-    var type = String(row.type || row.raw.Type || '');
-    if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
-    if (lastProgressResetRowId && String(row.raw.Id) === String(lastProgressResetRowId)) return;
-
-    var dur = Number(durationSec) || 0;
-    var t = Number(timeSec) || 0;
-    var pct = Number(percent);
-    if (!isFinite(pct) || pct < 0) pct = 0;
-    if (!pct && dur > 0 && t > 0) pct = Math.min(100, Math.round((t / dur) * 100));
-    if (dur > 0 && t > 0 && t >= dur - 15) pct = 100;
-    if (pct > 100) pct = 100;
-    if (pct < 0) pct = 0;
-    var played = pct >= 90;
-    if (row && row.raw && lastCompletedRowId && String(row.raw.Id) === String(lastCompletedRowId)) {
-      pct = 100;
-      played = true;
-    }
-    var ticks = Math.round(t * 10000000);
-
-    if (opts.realtime && !opts.force) {
-      var nowTs = Date.now();
-      if (nowTs - rtLastUiAt < RT_UI_TICK_MS) return;
-      rtLastUiAt = nowTs;
-    }
-    var wasWatched = !!row.watched;
-
-    writeLocalProgress(row.raw.Id, pct, played ? 0 : t, played);
-    applyLocalPlaybackState(row, played, pct, t);
-
-    try {
-      if (dur > 0 || t > 0) {
-        var nowTl = Date.now();
-        if (opts.force || nowTl - rtLastTimelineAt >= RT_TIMELINE_MS) {
-          rtLastTimelineAt = nowTl;
-          syncExternalTimeline(row, played ? 0 : t, dur > 0 ? dur : runtimeSecondsOf(row));
-        }
-      }
-    } catch (e) { }
-
-    try {
-      var live = playlistLiveRows[row.raw.Id];
-      if (live && live.item && live.item._display) {
-        var d = live.item._display;
-        var need = played !== !!d.watched || Math.round(pct) !== Math.round(Number(d.pct) || 0);
-        if (need) {
-          d.pct = pct;
-          d.watched = played;
-          updatePlaylistRowDom(live.$row, live.item);
-        }
-      }
-    } catch (e) { }
-
-    if (wasWatched !== played) invalidateUserDataCaches();
-
-    try {
-      tmdbSyncApplyRealtimeMirror(pct, t, dur);
-    } catch (e) { }
-
-    if (played) tmdbSyncApplyForRow(row, true);
-
-    if (pct < 5 && t < 10) return;
-
-    var forceSend = !opts.realtime || opts.force;
-    if (!forceSend) {
-      var nowNet = Date.now();
-      if (nowNet - rtLastNetAt < RT_NET_INTERVAL_MS) return;
-      rtLastNetAt = nowNet;
-    }
-
-    sendJfPlaybackProgress(row, row.raw.Id, pct, t, dur, played, forceSend);
   }
 
   function readPlaydata() {
@@ -7493,97 +7022,6 @@
       }
     } catch (e) { }
     return w;
-  }
-
-  function cachePlaybackState(id, type, pct, time, duration) {
-    lastPlaybackState = {
-      id: id || '',
-      type: type || '',
-      pct: Number(pct) || 0,
-      time: Number(time) || 0,
-      duration: Number(duration) || 0,
-      at: Date.now(),
-    };
-  }
-
-  function readPlaybackState(row, rowId) {
-    var id = rowId || (row && row.raw && row.raw.Id) || '';
-    if (externalPlay && id && String(externalPlay.rowId) === String(id)) {
-      var est = externalPlaybackEstimate();
-      if (est) return est;
-    }
-    var w = readPlaydata();
-    if (w && w.timeline) {
-      var pct = Number(w.timeline.percent) || 0;
-      var t = Number(w.timeline.time) || 0;
-      var dur = Number(w.timeline.duration) || 0;
-      var type = row ? String(row.type || row.raw.Type || '') : '';
-      cachePlaybackState(id, type, pct, t, dur);
-      return { pct: pct, time: t, duration: dur };
-    }
-    if (lastPlaybackState) {
-      var lId = id;
-      if (lastPlaybackState.id && lId && String(lastPlaybackState.id) === String(lId)) {
-        return {
-          pct: lastPlaybackState.pct,
-          time: lastPlaybackState.time,
-          duration: lastPlaybackState.duration,
-        };
-      }
-    }
-    return null;
-  }
-
-  function externalElapsedSeconds() {
-    if (!externalPlay) return 0;
-    var anchorAt = externalPlay.anchorAt || externalPlay.startAt;
-    var ms = Date.now() - anchorAt - externalPausedTotalMs;
-    if (externalPausedAt) ms -= Date.now() - externalPausedAt;
-    return Math.max(0, Math.floor(ms / 1000));
-  }
-
-  function anchorExternalPosition(cur) {
-    if (!externalPlay) return;
-    var c = Math.max(0, Number(cur) || 0);
-    if (!c) return;
-    externalPlay.anchorTime = c;
-    externalPlay.anchorAt = Date.now();
-  }
-
-  function externalPlaybackEstimate() {
-    if (!externalPlay || !externalPlay.rowId) return null;
-    var elapsed = externalElapsedSeconds();
-    if (elapsed < 10) return null;
-    var t = (externalPlay.anchorTime || externalPlay.resumeSec || 0) + elapsed;
-    var dur = externalPlay.durationSec || 0;
-    var pct = dur > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
-    return { pct: pct, time: t, duration: dur };
-  }
-
-  function tickExternalPlaybackProgress() {
-    if (!externalPlay || !externalPlay.rowId) return;
-    var elapsed = externalElapsedSeconds();
-    if (elapsed < 10) return;
-    var t = (externalPlay.anchorTime || externalPlay.resumeSec || 0) + elapsed;
-    var dur = externalPlay.durationSec || 0;
-    var pct = dur > 0 ? Math.min(100, Math.round((t / dur) * 100)) : 0;
-    cachePlaybackState(externalPlay.rowId, externalPlay.type, pct, t, dur);
-    if (currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)) {
-      reportPlaybackProgress(currentPlayRow, pct, t, dur, { realtime: true });
-    }
-  }
-
-  function startExternalPlaybackTicker() {
-    stopExternalPlaybackTicker();
-    externalPlayTicker = setInterval(tickExternalPlaybackProgress, EXTERNAL_TICKER_MS);
-  }
-
-  function stopExternalPlaybackTicker() {
-    if (!externalPlayTicker) return;
-    try {
-      clearInterval(externalPlayTicker);
-    } catch (e) { }
-    externalPlayTicker = null;
   }
 
   function restoreAndroidSeriesBackRoot() {
@@ -7638,114 +7076,6 @@
     } catch (e) {}
   }
 
-  function reAnchorExternalFromPlayer() {
-    try {
-      if (!externalPlay || !externalPlay.rowId) return;
-      var cur = null;
-      try {
-        if (Lampa.Player && typeof Lampa.Player.currentTime === 'function') {
-          cur = Lampa.Player.currentTime();
-        }
-      } catch (e) { }
-      if ((cur === null || cur === undefined || isNaN(Number(cur))) &&
-          Lampa.PlayerVideo && typeof Lampa.PlayerVideo.currentTime === 'function') {
-        try {
-          cur = Lampa.PlayerVideo.currentTime();
-        } catch (e2) { }
-      }
-      var d = Number(cur);
-      if (!isFinite(d) || d <= 0) return;
-      anchorExternalPosition(d);
-      var row = currentPlayRow && String(currentPlayRow.raw.Id) === String(externalPlay.rowId)
-        ? currentPlayRow
-        : null;
-      if (row) {
-        reportPlaybackProgress(row, 0, d, externalPlay.durationSec || 0, { realtime: true });
-      }
-    } catch (e) { }
-  }
-
-  function flushPlaylistProgress() {
-    try {
-      var rows = [];
-      var seen = {};
-      if (currentPlayRow && currentPlayRow.raw && currentPlayRow.raw.Id) {
-        seen[String(currentPlayRow.raw.Id)] = true;
-      }
-      var pl = (playlistBuild && playlistBuild.rows) || [];
-      for (var i = 0; i < pl.length; i++) {
-        if (!pl[i] || !pl[i].raw || !pl[i].raw.Id) continue;
-        var k = String(pl[i].raw.Id);
-        if (seen[k]) continue;
-        seen[k] = true;
-        rows.push(pl[i]);
-      }
-      for (var j = 0; j < rows.length; j++) {
-        var row = rows[j];
-        var type = String(row.type || row.raw.Type || '');
-        if (type !== 'Movie' && type !== 'Episode') continue;
-        var local = readLocalProgress(row.raw.Id);
-        if (!local) continue;
-        if (!localProgressIsNewer(local, row.raw.UserData)) continue;
-        var pct = local.played ? 100 : Number(local.pct) || 0;
-        if (pct <= 0) continue;
-        var t = local.played ? 0 : Number(local.time) || 0;
-        reportPlaybackProgress(row, pct, t, 0);
-      }
-    } catch (e) { }
-  }
-
-  function syncFlushPlaybackProgress(keepSession) {
-    var row = currentPlayRow || null;
-    var rowId = row && row.raw && row.raw.Id;
-    var rowType = row ? String(row.type || row.raw.Type || '') : '';
-    if (!rowId && lastPlaybackState) {
-      rowId = lastPlaybackState.id;
-      rowType = lastPlaybackState.type;
-    }
-    if (!rowId) return;
-    if (rowType && rowType !== 'Movie' && rowType !== 'Episode') return;
-    var state = readPlaybackState(row, rowId);
-    if (!state && externalPlay && String(externalPlay.rowId) === String(rowId)) {
-      state = externalPlaybackEstimate();
-    }
-    if (!state) return;
-    var t = state.time;
-    var dur = state.duration;
-    var pct = state.pct;
-    if (!pct && dur > 0 && t > 0) pct = Math.min(100, Math.round((t / dur) * 100));
-    if (dur > 0 && t > 0 && t >= dur - 15) pct = 100;
-    if (rowId && lastCompletedRowId && String(rowId) === String(lastCompletedRowId)) pct = 100;
-    var st = tmdbNormalizeState(pct, t, dur);
-    jfWriteUserData(row, rowId, { pct: st.pct, time: st.time, dur: st.duration, played: st.played });
-  }
-
-  function handleVideoSeeked(e) {
-    if (!currentPlayRow || !currentPlayRow.raw || !currentPlayRow.raw.Id) return;
-    var target = e && e.target;
-    if (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO') return;
-    var dur = Number(target.duration) || 0;
-    var t = Number(target.currentTime) || 0;
-    if (!isFinite(dur) || !isFinite(t)) return;
-    if (externalPlay && externalPlay.rowId && String(externalPlay.rowId) === String(currentPlayRow.raw.Id)) {
-      if (dur > 0) externalPlay.durationSec = dur;
-      anchorExternalPosition(t);
-      var pp = dur > 0 ? Math.min(100, Math.max(0, Math.round((t / dur) * 100))) : 0;
-      reportPlaybackProgress(currentPlayRow, pp, t, dur, { realtime: true });
-      return;
-    }
-    if (dur <= 0) return;
-    var pct = Math.min(100, Math.max(0, Math.round((t / dur) * 100)));
-    cachePlaybackState(
-      currentPlayRow.raw.Id,
-      String(currentPlayRow.type || currentPlayRow.raw.Type || ''),
-      pct,
-      t,
-      dur
-    );
-    reportPlaybackProgress(currentPlayRow, pct, t, dur);
-  }
-
   function findPlaybackRow(id) {
     if (currentPlayRow && currentPlayRow.raw && String(currentPlayRow.raw.Id) === String(id)) {
       return currentPlayRow;
@@ -7757,102 +7087,6 @@
     return null;
   }
 
-  function handleVideoEnded(e) {
-    try {
-      var isExt = !!(externalPlay && externalPlay.rowId);
-      var target = e && e.target;
-      if (!isExt && (!target || String(target.tagName || '').toUpperCase() !== 'VIDEO')) return;
-      var dur = isExt ? (externalPlay.durationSec || 0) : (Number(target.duration) || 0);
-      var t = isExt ? dur : (Number(target.currentTime) || 0);
-      var id = '';
-      var row = null;
-      if (isExt) {
-        id = String(externalPlay.rowId);
-        row = currentPlayRow && String(currentPlayRow.raw.Id) === id ? currentPlayRow : findPlaybackRow(id);
-        if (dur <= 0) {
-          try {
-            var rd = row && row.raw ? runtimeSecondsOf(row) : 0;
-            dur = rd || dur;
-          } catch (e2) { }
-        }
-      } else {
-        var pd = readPlaydata();
-        id = (pd && (pd.jellyfinId || (pd.item && pd.item.jellyfinId))) || '';
-        if (!id && currentPlayRow && currentPlayRow.raw) id = currentPlayRow.raw.Id;
-        if (!id) return;
-        row = findPlaybackRow(id);
-        if (!row || !row.raw) return;
-        if (!isFinite(dur) || !isFinite(t) || dur <= 0) return;
-      }
-      if (!id) return;
-      var type = isExt
-        ? String(externalPlay.type || (row && (row.type || (row.raw && row.raw.Type))) || '')
-        : String(row.type || row.raw.Type || '');
-      if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
-      lastCompletedRowId = id;
-      cachePlaybackState(id, type, 100, t, dur);
-      if (isExt) anchorExternalPosition(dur);
-      if (row && row.raw) reportPlaybackProgress(row, 100, t, dur);
-      scheduleHubRefresh();
-    } catch (err) { }
-  }
-
-  function currentPlaybackRow() {
-    var id = currentPlayItemId;
-    if (!id && currentPlayRow && currentPlayRow.raw) id = currentPlayRow.raw.Id;
-    if (!id) return null;
-    return findPlaybackRow(id);
-  }
-
-  function markCurrentEpisodeCompleted() {
-    var row = currentPlaybackRow();
-    if (!row || !row.raw) return;
-    var type = String(row.type || row.raw.Type || '');
-    if (type !== 'Movie' && type !== 'Episode' && type !== 'Video') return;
-    var id = String(row.raw.Id);
-    lastCompletedRowId = id;
-    cachePlaybackState(id, type, 100, 0, 0);
-    reportPlaybackProgress(row, 100, 0, 0);
-    if (externalPlay && String(externalPlay.rowId) === id) {
-      stopExternalPlaybackTicker();
-      externalPlay = null;
-      resetExternalPauseTracking();
-    }
-    scheduleHubRefresh();
-  }
-
-  function resetCurrentEpisodeProgress() {
-    var row = currentPlaybackRow();
-    if (!row || !row.raw) return;
-    var type = String(row.type || row.raw.Type || '');
-    if (type !== 'Movie' && type !== 'Episode') return;
-    var id = String(row.raw.Id);
-    if (lastCompletedRowId && String(lastCompletedRowId) === id) lastCompletedRowId = null;
-    cachePlaybackState(id, type, 0, 0, 0);
-    reportPlaybackProgress(row, 0, 0, 0);
-    if (externalPlay && String(externalPlay.rowId) === id) {
-      stopExternalPlaybackTicker();
-      externalPlay = null;
-      resetExternalPauseTracking();
-    }
-    lastProgressResetRowId = id;
-    if (lastProgressResetTimer) clearTimeout(lastProgressResetTimer);
-    lastProgressResetTimer = setTimeout(function () {
-      if (String(lastProgressResetRowId || '') === String(id)) lastProgressResetRowId = null;
-      lastProgressResetTimer = null;
-    }, 5000);
-    postItemUnplayed(id);
-    tmdbSyncApplyForRow(row, false);
-    scheduleHubRefresh();
-  }
-
-  function postItemUnplayed(id) {
-    jfWriteUserData(null, id, { pct: 0, time: 0, dur: 0, played: false });
-    try {
-      invalidateUserDataCaches();
-    } catch (e) { }
-  }
-
   function applyWatchedState(row, watched) {
     row.watched = watched;
     row.playedPct = watched ? 100 : 0;
@@ -7862,24 +7096,6 @@
     row.raw.UserData.PlayedPercentage = watched ? 100 : 0;
     row.raw.UserData.PlaybackPositionTicks = 0;
     return row;
-  }
-
-  function setItemWatched(row, watched) {
-    return resolveUserId().then(function (userId) {
-      var path =
-        '/Users/' +
-        encodeURIComponent(userId) +
-        '/PlayedItems/' +
-        encodeURIComponent(row.id);
-      var req = watched
-        ? jfHttp(path, { method: 'POST', jsonBody: {} })
-        : jfHttp(path, { method: 'DELETE', dataType: 'text' });
-      return req.then(function (result) {
-        invalidateUserDataCaches();
-        tmdbSyncApplyForRow(row, watched);
-        return result;
-      });
-    });
   }
 
   function notifyRowWatchedChange(row, watched) {
@@ -7947,14 +7163,7 @@
     function toggleEpisodeWatched(row, $row) {
       var target = !(row.watched || Number(row.playedPct) >= 100);
       applyWatchedState(row, target);
-      try {
-        writeLocalProgress(row.id, target ? 100 : 0, 0, target);
-        syncExternalTimeline(row, 0, 0);
-      } catch (e) { }
       notifyRowWatchedChange(row, target);
-      setItemWatched(row, target).catch(function () {
-        Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
-      });
     }
 
     function makeEpisodeRowDom(row) {
@@ -10926,9 +10135,6 @@
           var markWatched = sel.action === 'watched';
           applyWatchedState(row, markWatched);
           notifyRowWatchedChange(row, markWatched);
-          setItemWatched(row, markWatched).catch(function () {
-            Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
-          });
         }
       },
     });
@@ -10967,19 +10173,58 @@
       if ($chrome.find('.jellyfin-badge-episode').length) watchedClass += ' jellyfin-badge-watched--episode';
       $chrome.append('<div class="' + watchedClass + '">✓</div>');
     }
-    if (row.playedPct > 0 && row.playedPct < 100) {
-      $chrome.append(
-        '<div class="jellyfin-card-progress"><span style="width:' +
-        Math.min(100, Math.round(row.playedPct)) +
-        '%"></span></div>'
-      );
-    }
     $view.append($chrome);
   }
 
   function updateCardPoster($card, row) {
     var src = row.displayPoster || row.poster;
     if (src && src !== IMG_PLACEHOLDER) $card.find('.card__img').attr('src', src);
+  }
+
+  function seedTimelineFromRow(row) {
+    try {
+      var hash = '';
+      try { hash = timelineHashFor(row); } catch (e) { }
+      if (!hash) return;
+      var pct = Math.max(0, Number(row.playedPct) || 0);
+      if (row.watched && pct < 100) pct = 100;
+      var time = Math.max(0, Number(row.resumeSec) || 0);
+      var dur = Math.round((Number(row.raw && row.raw.RunTimeTicks) || 0) / 10000000);
+      Lampa.Timeline.update({ hash: hash, percent: pct, time: pct >= 100 ? (dur || 0) : time, duration: dur });
+    } catch (e) { }
+  }
+
+  function injectCardProgress($card, row) {
+    try {
+      var $view = $card.find('.card__view');
+      if (!$view.length) return;
+      $card.removeClass('jellyfin-card--watched');
+      seedTimelineFromRow(row);
+      var pct = 0, time = 0;
+      var hash = '';
+      try { hash = timelineHashFor(row); } catch (e) { }
+      if (hash) {
+        try {
+          var view = Lampa.Timeline.view(hash);
+          pct = Math.max(0, Number(view.percent) || 0);
+          time = Math.max(0, Number(view.time) || 0);
+        } catch (e) { }
+      }
+      if (!pct && !time) {
+        pct = Math.max(0, Number(row.playedPct) || 0);
+        time = Math.max(0, Number(row.resumeSec) || 0);
+      }
+      if (row.watched && pct < 100) pct = 100;
+      if (pct <= 0 && !time) {
+        $view.find('.jellyfin-card__progress').remove();
+        return;
+      }
+      var bar = $('<div class="jellyfin-card__progress"><span></span></div>');
+      bar.find('span').css('width', Math.max(0, Math.min(100, pct)) + '%');
+      $view.find('.jellyfin-card__progress').remove();
+      $view.append(bar);
+      if (row.watched) $card.addClass('jellyfin-card--watched');
+    } catch (e) { }
   }
 
   function PanelComponent(object) {
@@ -11277,10 +10522,6 @@
           } catch (err) {}
         }
 
-        try {
-          tmdbSyncRegisterCard(e.object);
-        } catch (err) { }
-
         if (!storageToggle('FullButton', true)) return;
 
         if (e.object.jellyfinRow) {
@@ -11320,9 +10561,6 @@
           }
         }
         var label = Lampa.Lang.translate('jellyfin_play_from_library');
-        if (ready.playedPct > 0 && ready.playedPct < 100) {
-          label += ' (' + Math.round(ready.playedPct) + '%)';
-        }
         items.push({ title: label, action: 'play' });
         if (!isHomePhotoRow(ready) && !isContainerRow(ready)) {
           items.push({
@@ -11369,9 +10607,6 @@
               var markWatched = sel.action === 'watched';
               applyWatchedState(ready, markWatched);
               notifyRowWatchedChange(ready, markWatched);
-              setItemWatched(ready, markWatched).catch(function () {
-                Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
-              });
             }
           },
         });
@@ -11452,14 +10687,12 @@
       var cached = findLibraryRow(method, id);
       if (cached) {
         mountButton(cached);
-        syncResolvedHistory(cached);
         return;
       }
 
       refreshLibraryIndex(false).then(function () {
         var resolved = findLibraryRow(method, id);
         mountButton(resolved);
-        if (resolved) syncResolvedHistory(resolved);
       });
     });
   }
@@ -11646,8 +10879,9 @@
       '.jellyfin-badge-music{left:.4em;top:.4em;background:rgba(175,82,222,.92);color:#fff;max-width:calc(100% - .8em);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
       '.jellyfin-badge-watched{right:.4em;top:.4em;background:rgba(52,199,89,.92);color:#fff}' +
       '.jellyfin-badge-watched--episode{top:2.1em}' +
-      '.jellyfin-card-progress{position:absolute;left:0;right:0;bottom:0;height:.28em;background:rgba(255,255,255,.18);z-index:5}' +
-      '.jellyfin-card-progress>span{display:block;height:100%;background:rgba(0,122,255,.95)}' +
+      '.jellyfin-card__progress{pointer-events:none;position:absolute;left:0;right:0;bottom:0;height:.28em;background:rgba(255,255,255,.22);z-index:4}' +
+      '.jellyfin-card__progress > span{display:block;height:100%;background:rgba(0,122,255,.95)}' +
+      '.jellyfin-card--watched .jellyfin-card__progress > span{background:rgba(52,199,89,.95)}' +
       '.jellyfin-state{padding:2em 1.2em;text-align:center;max-width:36em;margin:0 auto}' +
       '.jellyfin-state__title{font-size:1.1em;font-weight:700;margin-bottom:.6em}' +
       '.jellyfin-state__descr{opacity:.75;margin-bottom:1.2em;line-height:1.45}' +
@@ -12325,42 +11559,6 @@
       addToggle(parentComponent, STORAGE_PREFIX + 'TapPlay', 'jellyfin_set_tap_play', false);
     }
 
-    function registerSyncParams(parentComponent) {
-      if (typeof Lampa.Settings.create === 'function') {
-        Lampa.Template.add('settings_' + SYNC_COMPONENT, '<div></div>');
-
-        Lampa.SettingsApi.addParam({
-          component: SYNC_COMPONENT,
-          param: { name: STORAGE_PREFIX + 'SyncHint', type: 'static' },
-          field: { name: Lampa.Lang.translate('jellyfin_set_sync_watched_hint') },
-        });
-
-        addToggle(SYNC_COMPONENT, STORAGE_PREFIX + 'SyncWatched', 'jellyfin_set_sync_watched', true, function () {
-          Lampa.Settings.update();
-          scheduleTmdbSyncFromLibrary();
-        });
-
-        Lampa.SettingsApi.addParam({
-          component: parentComponent,
-          param: { type: 'button', name: STORAGE_PREFIX + 'Sync' },
-          field: { name: Lampa.Lang.translate('jellyfin_set_sync_group') },
-          onChange: function () {
-            Lampa.Settings.create(SYNC_COMPONENT, {
-              onBack: function () {
-                Lampa.Settings.create(parentComponent);
-              },
-            });
-          },
-        });
-        return;
-      }
-
-      addToggle(parentComponent, STORAGE_PREFIX + 'SyncWatched', 'jellyfin_set_sync_watched', true, function () {
-        Lampa.Settings.update();
-        scheduleTmdbSyncFromLibrary();
-      });
-    }
-
     function registerDisplayParams(component) {
       if (typeof Lampa.Settings.create === 'function') {
         Lampa.Template.add('settings_' + BUTTONS_COMPONENT, '<div></div>');
@@ -12398,7 +11596,6 @@
 
       registerCatalogParams(component);
       registerPlaybackParams(component);
-      registerSyncParams(component);
     }
 
     if (typeof Lampa.Settings.create === 'function') {
@@ -13336,19 +12533,41 @@
     var d = item._display || {};
     var id = d.id || (item && item.jellyfinId);
     if (!id) return;
-    var nowWatched = !!(d.watched || d.pct >= 100);
-    var target = !nowWatched;
-    d.watched = target;
-    d.pct = target ? 100 : 0;
-    try {
-      writeLocalProgress(id, d.pct, 0, target);
-      syncExternalTimeline({ raw: { Id: id } }, 0, 0);
-    } catch (e) { }
-    updatePlaylistRowDom($row, item);
+    var pct = Math.max(0, Number(d.pct) || 0);
     var fullRow = (item && item._row) || findJellyfinRowById(id);
-    setItemWatched(fullRow || { id: id }, target).catch(function () {
-      Lampa.Bell.push({ text: Lampa.Lang.translate('jellyfin_error') });
-    });
+    var durSec = fullRow && fullRow.raw
+      ? Math.round((Number(fullRow.raw.RunTimeTicks) || 0) / 10000000)
+      : 0;
+    var hash = '';
+    try { if (fullRow) hash = timelineHashFor(fullRow); } catch (e) { }
+
+    var applyState = function (percent, watched) {
+      d.watched = watched;
+      d.pct = percent;
+      if (fullRow) applyWatchedState(fullRow, watched);
+      try {
+        if (hash) Lampa.Timeline.update({
+          hash: hash,
+          percent: percent,
+          time: watched ? durSec : 0,
+          duration: durSec,
+        });
+      } catch (e) { }
+      updatePlaylistRowDom($row, item);
+      if (fullRow) {
+        notifyRowWatchedChange(fullRow, watched);
+        jfWriteUserData(fullRow, id, { pct: percent, time: 0, dur: durSec, played: watched });
+      }
+    };
+
+    if (pct <= 0) {
+      applyState(100, true);
+    } else if (pct >= 1 && pct < 100) {
+      applyState(100, true);
+      applyState(0, false);
+    } else {
+      applyState(0, false);
+    }
   }
 
   function bindPlaylistRingClick($state, item, $row) {
@@ -13487,23 +12706,6 @@
     return $row;
   }
 
-  function refreshPlaylistItemDisplay(item) {
-    try {
-      if (!item || !item._display) return;
-      var id = item.jellyfinId || item._display.id;
-      if (!id) return;
-      var local = readLocalProgress(id);
-      if (!local) return;
-      if (local.played) {
-        item._display.watched = true;
-        item._display.pct = 100;
-      } else {
-        item._display.watched = false;
-        item._display.pct = Math.min(100, Number(local.pct) || 0);
-      }
-    } catch (e) { }
-  }
-
   function showJellyfinPlayerPlaylist(items) {
     try {
       Lampa.PlayerPlaylist.active();
@@ -13595,7 +12797,6 @@
               playlistLiveRows = {};
               $rows.empty();
               visible.forEach(function (item, idx) {
-                refreshPlaylistItemDisplay(item);
                 var $row = makePlayerPlaylistRowDom(item);
                 $row.attr('data-index', idx);
                 if (item && item._display && item._display.id) {
@@ -13618,7 +12819,6 @@
 
       var needSelect = null;
       visible.forEach(function (item, idx) {
-        refreshPlaylistItemDisplay(item);
         var $row = makePlayerPlaylistRowDom(item);
         $row.attr('data-index', idx);
         if (item && item._display && item._display.id) {
@@ -13771,9 +12971,6 @@
         Lampa.PlayerPlaylist.prev = function () {
           if (episodePrevButtonDisabled) return;
           try {
-            resetCurrentEpisodeProgress();
-          } catch (e) { }
-          try {
             var ppl = Lampa.PlayerPlaylist.get() || [];
             var pp = currentEpisodePosition(ppl);
             if (pp !== null && pp !== undefined && ppl[pp - 1]) {
@@ -13788,9 +12985,6 @@
         var origNext = Lampa.PlayerPlaylist.next;
         Lampa.PlayerPlaylist.next = function () {
           if (episodeNextButtonDisabled) return;
-          try {
-            markCurrentEpisodeCompleted();
-          } catch (e) { }
           try {
             var npl = Lampa.PlayerPlaylist.get() || [];
             var np = currentEpisodePosition(npl);
@@ -13857,1098 +13051,6 @@
     } catch (e) { }
   }
 
-  var tmdbSyncEnabled = function () {
-    return storageToggle('SyncWatched', true) && !!(apiBase() && apiKey());
-  };
-
-  var tmdbSync = {
-    guards: {},
-    pushed: {},
-    active: [],
-    seriesCache: {},
-    episodesCache: {},
-    episodesInflight: {},
-    bulkTimer: null,
-    pruneAt: 0,
-    session: null,
-    sessionBusy: false,
-    sessionQueued: false,
-    sessionTimer: null,
-    sessionToken: 0,
-    sessionPaused: false,
-    sessionResolving: '',
-    jfActiveHash: '',
-    jfLastWriteAt: 0,
-    jfPlaybackActive: false,
-    jfPlaybackRowId: '',
-  };
-
-  function tmdbSyncPrune() {
-    var now = Date.now();
-    var keys = Object.keys(tmdbSync.guards);
-    if (keys.length > 60) {
-      keys.forEach(function (k) {
-        if (now - (tmdbSync.guards[k].at || 0) > 120000) delete tmdbSync.guards[k];
-      });
-    }
-    keys = Object.keys(tmdbSync.pushed);
-    if (keys.length > 200) {
-      keys.forEach(function (k) {
-        if (now - tmdbSync.pushed[k].at > 1800000) delete tmdbSync.pushed[k];
-      });
-    }
-    [tmdbSync.seriesCache, tmdbSync.episodesCache].forEach(function (c) {
-      Object.keys(c).forEach(function (k) {
-        if (now - c[k].at > 1200000) delete c[k];
-      });
-    });
-  }
-
-  function tmdbSyncRememberPush(hash, pct) {
-    tmdbSync.pushed[hash] = { pct: Math.round(Number(pct) || 0), at: Date.now() };
-  }
-
-  function tmdbSyncShouldPush(hash, pct) {
-    var rec = tmdbSync.pushed[hash];
-    if (!rec) return true;
-    if (Date.now() - rec.at > TMDB_PUSH_DEDUP_MS) return true;
-    return rec.pct !== Math.round(Number(pct) || 0);
-  }
-
-  function tmdbSyncGuard(hash, pct) {
-    if (!hash) return;
-    if (Date.now() - tmdbSync.pruneAt > 120000) {
-      tmdbSync.pruneAt = Date.now();
-      tmdbSyncPrune();
-    }
-    tmdbSync.guards[hash] = { at: Date.now(), pct: Math.round(Number(pct) || 0) };
-  }
-
-  function tmdbSyncGuardHit(hash, pct) {
-    if (!hash || !tmdbSync.guards[hash]) return false;
-    var g = tmdbSync.guards[hash];
-    if (Date.now() - g.at >= TMDB_GUARD_RETAIN_MS) {
-      delete tmdbSync.guards[hash];
-      return false;
-    }
-    return Math.round(Number(pct) || 0) === g.pct;
-  }
-
-  function tmdbMovieHash(originalTitle) {
-    return Lampa.Utils.hash(String(originalTitle || ''));
-  }
-
-  function tmdbEpisodeHash(originalName, season, episode) {
-    var s = Number(season) || 0;
-    var e = Number(episode) || 0;
-    return Lampa.Utils.hash([s, s > 10 ? ':' : '', e, String(originalName || '')].join(''));
-  }
-
-  function tmdbNormalizeState(pct, time, dur) {
-    var t = Math.max(0, Number(time) || 0);
-    var d = Math.max(0, Number(dur) || 0);
-    var p = Number(pct);
-    if (!isFinite(p) || p < 0) p = 0;
-    if (p > 100) p = 100;
-    if (d > 0 && t > 0 && t >= d - 30) p = 100;
-    if (d > 0 && p > 0 && p < 100 && t <= 0) t = Math.round((p / 100) * d);
-    var played = p >= 90;
-    if (played) {
-      p = 100;
-      t = 0;
-    }
-    return { pct: p, time: t, duration: d, played: played };
-  }
-
-  function tmdbSyncWriteTmdb(hash, srcUpdated, pct, time, dur, force) {
-    if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
-    if (!force && tmdbSync.jfPlaybackActive && tmdbSync.jfActiveHash === String(hash)) return;
-    var st = tmdbNormalizeState(pct, time, dur);
-    if (!force) {
-      var cur = tmdbSyncTmdbTimeline(hash);
-      if (cur) {
-        var cu = Number(cur.updated) || 0;
-        var su = Number(srcUpdated) || 0;
-        if (su && cu && su < cu) return;
-      }
-    }
-    tmdbSyncGuard(hash, st.pct);
-    try {
-      Lampa.Timeline.update({
-        hash: hash,
-        percent: st.pct,
-        time: st.time,
-        duration: st.duration,
-        profile: 0,
-        updated: Date.now(),
-      });
-    } catch (e) { }
-  }
-
-  function tmdbSyncWriteHash(hash, pct) {
-    tmdbSyncWriteTmdb(hash, Date.now(), pct, 0, 0);
-  }
-
-  function tmdbSyncWriteTimeline(hash, pct, time, duration) {
-    tmdbSyncWriteTmdb(hash, Date.now(), pct, time, duration);
-  }
-
-  function tmdbSyncFetchMeta(tmdb) {
-    if (!tmdb || !tmdb.id) return Promise.resolve(null);
-    return fetchTmdbMeta({ method: String(tmdb.method || ''), id: String(tmdb.id) });
-  }
-
-  function tmdbSyncMarkMovie(tmdb, played) {
-    if (!tmdb || String(tmdb.method) !== 'movie') return Promise.resolve();
-    return tmdbSyncFetchMeta(tmdb)
-      .then(function (meta) {
-        if (!meta || !meta.originalTitle) return;
-        tmdbSyncWriteHash(tmdbMovieHash(meta.originalTitle), played ? 100 : 0);
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncMarkEpisode(tmdb, season, episode, played) {
-    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
-    if (!(Number(season) > 0) || !(Number(episode) > 0)) return Promise.resolve();
-    return tmdbSyncFetchMeta(tmdb)
-      .then(function (meta) {
-        var name = meta && (meta.originalName || meta.originalTitle);
-        if (!name) return;
-        tmdbSyncWriteHash(tmdbEpisodeHash(name, season, episode), played ? 100 : 0);
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncSeriesEpisodes(seriesId) {
-    if (!seriesId) return Promise.resolve([]);
-    var key = String(seriesId);
-    var cached = tmdbSync.episodesCache[key];
-    if (cached && Date.now() - cached.at < 10 * 60 * 1000) return Promise.resolve(cached.rows);
-    if (tmdbSync.episodesInflight[key]) return tmdbSync.episodesInflight[key];
-    var inflight = fetchEpisodes(key)
-      .then(function (rows) {
-        tmdbSync.episodesCache[key] = { at: Date.now(), rows: rows || [] };
-        return rows || [];
-      })
-      .finally(function () {
-        delete tmdbSync.episodesInflight[key];
-      });
-    tmdbSync.episodesInflight[key] = inflight;
-    return inflight;
-  }
-
-  function tmdbSyncMarkSeriesAll(tmdb, played) {
-    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
-    return resolveTmdbJellyfinRowAsync(tmdb)
-      .then(function (seriesRow) {
-        if (!seriesRow || !seriesRow.id) return;
-        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
-          var items = [];
-          rows.forEach(function (r) {
-            if (!r.raw) return;
-            var n = episodeNumbers(r.raw);
-            if (n.season && n.episode) items.push(n);
-          });
-          if (!items.length) return;
-          return tmdbSyncFetchMeta(tmdb).then(function (meta) {
-            var name = meta && (meta.originalName || meta.originalTitle);
-            if (!name) return;
-            items.forEach(function (n) {
-              tmdbSyncWriteHash(tmdbEpisodeHash(name, n.season, n.episode), played ? 100 : 0);
-            });
-          });
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncSeriesByJellyfinId(seriesId) {
-    if (!seriesId) return null;
-    var keys = Object.keys(libraryIndex.byTmdb || {});
-    for (var i = 0; i < keys.length; i++) {
-      var row = libraryIndex.byTmdb[keys[i]];
-      if (!row || !row.raw) continue;
-      if (String(row.raw.Id || row.id) === String(seriesId) && String(row.type || row.raw.Type) === 'Series') return row;
-    }
-    return null;
-  }
-
-  function tmdbSyncResolveSeriesRowAsync(seriesId) {
-    var cached = tmdbSyncSeriesByJellyfinId(seriesId);
-    if (cached) return Promise.resolve(cached);
-    if (!seriesId) return Promise.resolve(null);
-    return resolveUserId()
-      .then(function (userId) {
-        return jfHttp(
-          '/Users/' +
-          encodeURIComponent(userId) +
-          '/Items/' +
-          encodeURIComponent(seriesId) +
-          '?Fields=' +
-          encodeURIComponent('ProviderIds,Type,Id,Name,UserData,ImageTags,RunTimeTicks')
-        );
-      })
-      .then(function (item) {
-        if (!item || !item.Id || String(item.Type || '') !== 'Series') return null;
-        var row = mapRow(item);
-        return row && (row.tmdb || row.id) ? row : null;
-      })
-      .catch(function () {
-        return null;
-      });
-  }
-
-  function tmdbSyncApplyForRow(row, played) {
-    if (!tmdbSyncEnabled() || !row || !row.raw) return;
-    var type = String(row.type || row.raw.Type || '');
-    var tmdb = tmdbFromItem(row.raw);
-    if (!tmdb) return;
-    if (type === 'Movie') {
-      tmdbSyncMarkMovie(tmdb, played);
-      return;
-    }
-    if (type === 'Episode') {
-      if (!row.raw.SeriesId) return;
-      var n = episodeNumbers(row.raw);
-      if (!n.season || !n.episode) return;
-      tmdbSyncResolveSeriesRowAsync(row.raw.SeriesId)
-        .then(function (sr) {
-          if (!sr || !sr.tmdb) return;
-          tmdbSyncMarkEpisode(sr.tmdb, n.season, n.episode, played);
-        })
-        .catch(function () { });
-      return;
-    }
-    if (type === 'Series') {
-      tmdbSyncMarkSeriesAll(tmdb, played);
-    }
-  }
-
-  function tmdbResumeSecondsOf(row) {
-    if (!row) return 0;
-    var ud = (row.raw && row.raw.UserData) || {};
-    var resume = Number(row.resumeSec) || 0;
-    if (!resume && ud.PlaybackPositionTicks) resume = Math.round(Number(ud.PlaybackPositionTicks) / 10000000);
-    return Math.max(0, Number(resume) || 0);
-  }
-
-  function tmdbRowWatched(row) {
-    if (!row) return false;
-    var ud = (row.raw && row.raw.UserData) || {};
-    return !!(row.watched || ud.Played || Number(row.playedPct) >= 100);
-  }
-
-  function tmdbSyncApplyResumeMovie(tmdb, resume, duration) {
-    if (!tmdb || String(tmdb.method) !== 'movie') return Promise.resolve();
-    var pct = duration > 0 ? Math.min(100, Math.round((resume / duration) * 100)) : 0;
-    if (pct <= 0 || pct >= 90) return Promise.resolve();
-    return tmdbSyncFetchMeta(tmdb)
-      .then(function (meta) {
-        if (!meta || !meta.originalTitle) return;
-        tmdbSyncWriteTimeline(tmdbMovieHash(meta.originalTitle), pct, resume, duration);
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncApplyResumeSeries(tmdb) {
-    if (!tmdb || String(tmdb.method) !== 'tv') return Promise.resolve();
-    return resolveTmdbJellyfinRowAsync(tmdb)
-      .then(function (seriesRow) {
-        if (!seriesRow || !seriesRow.id) return;
-        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
-          var wants = [];
-          rows.forEach(function (r) {
-            if (!r.raw || tmdbRowWatched(r)) return;
-            var n = episodeNumbers(r.raw);
-            if (n.season && n.episode) {
-              var resume = tmdbResumeSecondsOf(r);
-              if (resume > 0) wants.push({ row: r, n: n, resume: resume });
-            }
-          });
-          if (!wants.length) return;
-          return tmdbSyncFetchMeta(tmdb).then(function (meta) {
-            var name = meta && (meta.originalName || meta.originalTitle);
-            if (!name) return;
-            wants.forEach(function (w) {
-              var dur = runtimeSecondsOf(w.row);
-              var pct = dur > 0 ? Math.min(100, Math.round((w.resume / dur) * 100)) : 0;
-              if (pct <= 0 || pct >= 90) return;
-              tmdbSyncWriteTimeline(tmdbEpisodeHash(name, w.n.season, w.n.episode), pct, w.resume, dur);
-            });
-          });
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncApplyResumeForRow(row) {
-    if (!tmdbSyncEnabled() || !row || !row.raw) return;
-    if (tmdbRowWatched(row)) return;
-    var type = String(row.type || row.raw.Type || '');
-    var tmdb = tmdbFromItem(row.raw);
-    if (!tmdb) return;
-    if (type === 'Movie') {
-      var resume = tmdbResumeSecondsOf(row);
-      var dur = runtimeSecondsOf(row);
-      if (resume > 0 && dur > 0) tmdbSyncApplyResumeMovie(tmdb, resume, dur);
-      return;
-    }
-    if (type === 'Series') {
-      tmdbSyncApplyResumeSeries(tmdb);
-      return;
-    }
-    if (type === 'Episode') {
-      if (!row.raw.SeriesId) return;
-      var sr = tmdbSyncSeriesByJellyfinId(row.raw.SeriesId);
-      if (!sr || !sr.tmdb) return;
-      var n = episodeNumbers(row.raw);
-      if (!n.season || !n.episode) return;
-      var resume2 = tmdbResumeSecondsOf(row);
-      var dur2 = runtimeSecondsOf(row);
-      if (resume2 <= 0 || dur2 <= 0) return;
-      tmdbSyncFetchMeta(sr.tmdb)
-        .then(function (meta) {
-          var name = meta && (meta.originalName || meta.originalTitle);
-          if (!name) return;
-          var pct = Math.min(100, Math.round((resume2 / dur2) * 100));
-          if (pct <= 0 || pct >= 90) return;
-          tmdbSyncWriteTimeline(tmdbEpisodeHash(name, n.season, n.episode), pct, resume2, dur2);
-        })
-        .catch(function () { });
-    }
-  }
-
-  function tmdbSyncJfSecondsOf(row) {
-    if (!row || !row.raw) return 0;
-    var ud = row.raw.UserData || {};
-    var t = Number(row.resumeSec) || 0;
-    if (!t && ud.PlaybackPositionTicks) t = Math.round(Number(ud.PlaybackPositionTicks) / 10000000);
-    return Math.max(0, Number(t) || 0);
-  }
-
-  function tmdbSyncJfUpdatedOf(row) {
-    if (!row || !row.raw) return 0;
-    var ud = row.raw.UserData || {};
-    if (ud.LastPlayedDate) {
-      var d = Date.parse(ud.LastPlayedDate);
-      if (isFinite(d)) return d;
-    }
-    return 0;
-  }
-
-  function tmdbSyncTmdbTimeline(hash) {
-    try {
-      if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.view !== 'function') return null;
-      var v = Lampa.Timeline.view(hash);
-      if (!v) return null;
-      var p = Number(v.percent) || 0;
-      var u = Number(v.updated) || 0;
-      var t = Number(v.time) || 0;
-      if (p <= 0 && u <= 0 && t <= 0) return null;
-      return { percent: p, time: t, duration: Number(v.duration) || 0, updated: u };
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function tmdbSyncWriteJfUserData(row, timeSec, played, durSec) {
-    var raw = row && row.raw;
-    if (!raw || !raw.Id) return;
-    jfWriteUserData(row, raw.Id, {
-      pct: played ? 100 : 0,
-      time: played ? 0 : (Number(timeSec) || 0),
-      dur: Number(durSec) || 0,
-      played: !!played,
-    });
-  }
-
-  function tmdbSyncReconcileOnOpen(row) {
-    if (!tmdbSyncEnabled() || !row || !row.raw) return Promise.resolve(null);
-    if (tmdbSync.jfPlaybackActive) return Promise.resolve(null);
-    var type = String(row.type || row.raw.Type || '');
-    var tmdb = tmdbFromItem(row.raw);
-    if (!tmdb) return Promise.resolve(null);
-    if (type !== 'Movie' && type !== 'Episode') return Promise.resolve(null);
-    var jfTime = tmdbSyncJfSecondsOf(row);
-    var jfPlayed = tmdbRowWatched(row);
-    var jfUpdated = tmdbSyncJfUpdatedOf(row);
-    var durSec = runtimeSecondsOf(row);
-
-    return tmdbSyncFetchMeta(tmdb)
-      .then(function (meta) {
-        var name = null;
-        var hash = null;
-        var n = null;
-        if (type === 'Movie') {
-          name = meta && (meta.originalTitle || meta.originalName);
-          if (name) hash = tmdbMovieHash(name);
-        } else {
-          name = meta && (meta.originalName || meta.originalTitle);
-          if (!name) return null;
-          n = episodeNumbers(row.raw);
-          if (!n.season || !n.episode) return null;
-          hash = tmdbEpisodeHash(name, n.season, n.episode);
-        }
-        if (!hash) return null;
-
-        var tlv = tmdbSyncTmdbTimeline(hash);
-        var tmdbTime = tlv ? tlv.time : 0;
-        var tmdbPct = tlv ? tlv.percent : 0;
-        var tmdbUpdated = tlv ? tlv.updated : 0;
-        var tmdbPlayed = !!(tlv && (tmdbPct >= 100 || (durSec > 0 && tmdbTime >= durSec - 30)));
-        var tmdbHas = !!(tlv && (tmdbPct > 0 || tmdbUpdated > 0));
-
-        var jfHas = jfTime > 0 || jfPlayed || jfUpdated > 0;
-        if (!tmdbHas && !jfHas) return null;
-
-        var tmdbNewer = null;
-        if (tmdbUpdated && jfUpdated && Math.abs(tmdbUpdated - jfUpdated) < 60000) {
-          tmdbNewer = null;
-        } else if (tmdbUpdated && jfUpdated) {
-          tmdbNewer = tmdbUpdated > jfUpdated;
-        } else if (tmdbUpdated && !jfUpdated) {
-          tmdbNewer = tmdbHas;
-        } else if (!tmdbUpdated && jfUpdated) {
-          tmdbNewer = false;
-        }
-        if (tmdbNewer === null) return null;
-
-        if (tmdbNewer) {
-          var newResume = tmdbPlayed ? 0 : tmdbTime;
-          tmdbSyncWriteJfUserData(row, newResume, tmdbPlayed, durSec);
-          return { resumeSec: newResume, played: tmdbPlayed };
-        } else {
-          if (jfPlayed) {
-            tmdbSyncWriteHash(hash, 100);
-          } else if (jfTime > 0) {
-            var jp = durSec > 0 ? Math.min(100, Math.round((jfTime / durSec) * 100)) : 0;
-            if (jp > 0 && jp < 90) tmdbSyncWriteTimeline(hash, jp, jfTime, durSec);
-          }
-          return { resumeSec: jfTime, played: jfPlayed };
-        }
-      })
-      .catch(function () { return null; });
-  }
-
-  function tmdbSyncResolveResumeForLaunch(row) {
-    return tmdbSyncReconcileOnOpen(row)
-      .then(function (win) {
-        if (win && row && typeof win.resumeSec !== 'undefined') {
-          row.resumeSec = win.played ? 0 : win.resumeSec;
-          try {
-            writeLocalProgress(row.id, win.played ? 100 : 0, win.played ? 0 : win.resumeSec, win.played);
-          } catch (e) { }
-        }
-        return row;
-      })
-      .catch(function () { return row; });
-  }
-
-  function tmdbSyncBulkFromLibrary() {
-    if (!tmdbSyncEnabled()) return;
-    var rows = [];
-    var keys = Object.keys(libraryIndex.byTmdb || {});
-    keys.forEach(function (k) {
-      var row = libraryIndex.byTmdb[k];
-      if (!row || !row.tmdb) return;
-      if (tmdbRowWatched(row)) rows.push({ row: row, kind: 'watched' });
-      else if (tmdbResumeSecondsOf(row) > 0) rows.push({ row: row, kind: 'resume' });
-    });
-    if (!rows.length) return;
-    promiseAllChunks(rows, 4, function (entry) {
-      if (entry.kind === 'watched') return tmdbSyncApplyForRow(entry.row, true);
-      tmdbSyncApplyResumeForRow(entry.row);
-      return null;
-    }).catch(function () { });
-  }
-
-  function scheduleTmdbSyncFromLibrary() {
-    try {
-      if (tmdbSync.bulkTimer) clearTimeout(tmdbSync.bulkTimer);
-    } catch (e) { }
-    tmdbSync.bulkTimer = setTimeout(function () {
-      tmdbSync.bulkTimer = null;
-      tmdbSyncBulkFromLibrary();
-    }, 1500);
-  }
-
-  function resolveTmdbJellyfinRowAsync(tmdb) {
-    var row = findLibraryRow(String(tmdb.method || ''), String(tmdb.id || ''));
-    if (row) return Promise.resolve(row);
-    return refreshLibraryIndex(false).then(function () {
-      return findLibraryRow(String(tmdb.method || ''), String(tmdb.id || ''));
-    });
-  }
-
-  function tmdbPushItemPlayed(itemId, hash) {
-    return resolveUserId()
-      .then(function (userId) {
-        return jfHttp(
-          '/Users/' + encodeURIComponent(userId) + '/PlayedItems/' + encodeURIComponent(itemId),
-          { method: 'POST', jsonBody: {} }
-        );
-      })
-      .then(function () {
-        if (hash) tmdbSyncRememberPush(hash, 100);
-        invalidateUserDataCaches();
-      })
-      .catch(function () { });
-  }
-
-  function tmdbPushItemUnplayed(itemId, hash) {
-    return resolveUserId()
-      .then(function (userId) {
-        return jfHttp(
-          '/Users/' + encodeURIComponent(userId) + '/PlayedItems/' + encodeURIComponent(itemId),
-          { method: 'DELETE', dataType: 'text' }
-        );
-      })
-      .then(function () {
-        if (hash) tmdbSyncRememberPush(hash, 0);
-        invalidateUserDataCaches();
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncPlaybackSessionId() {
-    var s = '';
-    var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    for (var i = 0; i < 12; i++) {
-      s += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return s;
-  }
-
-  function tmdbSyncSessionSnapshot() {
-    var s = tmdbSync.session || {};
-    return {
-      hash: s.hash || '',
-      itemId: s.itemId || '',
-      userId: s.userId || '',
-      mediaSourceId: s.mediaSourceId || '',
-      playSessionId: s.playSessionId || '',
-      playMethod: s.playMethod || 'DirectStream',
-      positionSec: Number(s.positionSec) || 0,
-      durationSec: Number(s.durationSec) || 0,
-      paused: !!s.paused,
-      started: !!s.started,
-    };
-  }
-
-  function sendTmdbSyncReport(method, snap) {
-    if (!snap || !snap.itemId || !apiBase() || !apiKey()) return Promise.resolve();
-    if (!snap.userId) snap.userId = String(storedUserId() || cachedUserId || '');
-    if (!snap.userId) return Promise.resolve();
-    var path = '/Sessions/Playing';
-    if (method === 'progress') path += '/Progress';
-    else if (method === 'stopped') path += '/Stopped';
-    var body = {
-      ItemId: snap.itemId,
-      UserId: snap.userId,
-      PlaySessionId: snap.playSessionId,
-      PositionTicks: secondsToTicks(snap.positionSec),
-      IsPaused: !!snap.paused,
-      IsMuted: false,
-      VolumeLevel: 100,
-      PlayMethod: snap.playMethod || 'DirectStream',
-      CanSeek: true,
-    };
-    if (snap.mediaSourceId) body.MediaSourceId = snap.mediaSourceId;
-    if (method === 'stopped') body.Failed = false;
-    return jfHttp(path, { method: 'POST', jsonBody: body, cache: false }).catch(function () { });
-  }
-
-  function scheduleTmdbSyncSessionRepeat() {
-    try {
-      if (tmdbSync.sessionTimer) clearTimeout(tmdbSync.sessionTimer);
-    } catch (e) { }
-    tmdbSync.sessionTimer = setTimeout(function () {
-      tmdbSync.sessionTimer = null;
-      if (tmdbSync.session && tmdbSync.session.itemId) {
-        flushTmdbSyncSession(false);
-        scheduleTmdbSyncSessionRepeat();
-      }
-    }, 10000);
-  }
-
-  function flushTmdbSyncSession(force) {
-    if (!tmdbSync.session || !tmdbSync.session.itemId) return;
-    var now = Date.now();
-    if (!force && now - (tmdbSync.session.lastReportAt || 0) < TMDB_SESSION_INTERVAL_MS) return;
-    if (tmdbSync.sessionBusy) {
-      tmdbSync.sessionQueued = true;
-      return;
-    }
-    tmdbSync.session.lastReportAt = now;
-    var snap = tmdbSyncSessionSnapshot();
-    var method = snap.started ? 'progress' : 'start';
-    if (method === 'start') tmdbSync.session.started = true;
-    tmdbSync.sessionBusy = true;
-    sendTmdbSyncReport(method, snap).finally(function () {
-      tmdbSync.sessionBusy = false;
-      if (tmdbSync.sessionQueued) {
-        tmdbSync.sessionQueued = false;
-        flushTmdbSyncSession(true);
-      }
-    });
-  }
-
-  function tmdbSyncReportSession(desc, t, dur) {
-    try {
-      if (!tmdbSyncEnabled() || !desc || !desc.id) return;
-      t = Math.max(0, Number(t) || 0);
-      dur = Math.max(0, Number(dur) || 0);
-      if (dur <= 0 || t < 10) return;
-      var token = ++tmdbSync.sessionToken;
-
-      if (tmdbSync.session && String(tmdbSync.session.hash) !== String(desc.hash)) {
-        var old = tmdbSync.session;
-        tmdbSync.session = null;
-        tmdbSync.sessionQueued = false;
-        tmdbSync.sessionResolving = '';
-        tmdbSyncSessionStopSchedule();
-        sendTmdbSyncReport('stopped', old);
-      }
-
-      if (tmdbSync.session && tmdbSync.session.itemId) {
-        tmdbSync.session.positionSec = t;
-        tmdbSync.session.durationSec = dur;
-        tmdbSync.session.paused = !!tmdbSync.sessionPaused;
-        flushTmdbSyncSession(false);
-        return;
-      }
-
-      var resolveKey = String(desc.hash);
-      if (tmdbSync.sessionResolving === resolveKey) return;
-      tmdbSync.sessionResolving = resolveKey;
-
-      var userId = '';
-      resolveUserId()
-        .then(function (uid) {
-          userId = uid;
-          if (token !== tmdbSync.sessionToken) return null;
-          return resolveTmdbJellyfinRowAsync({ method: String(desc.method || 'movie'), id: String(desc.id) });
-        })
-        .then(function (row) {
-          if (token !== tmdbSync.sessionToken || !row || !row.id) return null;
-          if (desc.season && desc.episode && String(row.type || row.raw.Type) === 'Series') {
-            return tmdbSyncSeriesEpisodes(row.id).then(function () {
-              if (token !== tmdbSync.sessionToken) return null;
-              var ep = tmdbFindEpisodeRow(row, desc.season, desc.episode);
-              return ep && ep.id ? ep : null;
-            });
-          }
-          return row;
-        })
-        .then(function (row) {
-          if (token !== tmdbSync.sessionToken) {
-            if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
-            return;
-          }
-          if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
-          if (!row) return;
-          tmdbSync.session = {
-            hash: String(desc.hash),
-            itemId: String(row.id),
-            userId: String(userId || ''),
-            mediaSourceId: row.mediaSourceId ||
-              (row.raw && row.raw.MediaSources && row.raw.MediaSources[0] && row.raw.MediaSources[0].Id) || '',
-            playSessionId: tmdbSyncPlaybackSessionId(),
-            positionSec: t,
-            durationSec: dur,
-            paused: !!tmdbSync.sessionPaused,
-            lastReportAt: 0,
-            started: false,
-          };
-          flushTmdbSyncSession(true);
-          scheduleTmdbSyncSessionRepeat();
-        })
-        .catch(function () {
-          if (tmdbSync.sessionResolving === resolveKey) tmdbSync.sessionResolving = '';
-        });
-    } catch (e) { }
-  }
-
-  function tmdbSyncStopSession(complete) {
-    if (!tmdbSync.session || !tmdbSync.session.itemId) return;
-    var old = tmdbSync.session;
-    if (complete && Number(old.durationSec) > 0) {
-      old.positionSec = Math.max(Number(old.positionSec) || 0, Number(old.durationSec));
-    }
-    tmdbSync.session = null;
-    tmdbSync.sessionQueued = false;
-    tmdbSync.sessionToken++;
-    tmdbSync.sessionResolving = '';
-    tmdbSyncSessionStopSchedule();
-    sendTmdbSyncReport('stopped', old);
-  }
-
-  function tmdbSyncSessionStopSchedule() {
-    try {
-      if (tmdbSync.sessionTimer) clearTimeout(tmdbSync.sessionTimer);
-    } catch (e) { }
-    tmdbSync.sessionTimer = null;
-  }
-
-  function tmdbPushWatchedDesc(desc) {
-    if (!desc || !desc.id) return;
-    var hash = desc.hash;
-    if (!tmdbSyncShouldPush(hash, 100)) return;
-    var method = desc.method || (desc.originalName ? 'tv' : 'movie');
-    if (method === 'movie') {
-      resolveTmdbJellyfinRowAsync({ method: 'movie', id: String(desc.id) })
-        .then(function (row) {
-          if (!row || !row.id) return;
-          if (!tmdbSyncShouldPush(hash, 100)) return;
-          tmdbPushItemPlayed(row.id, hash);
-        })
-        .catch(function () { });
-      return;
-    }
-    if (!(Number(desc.season) > 0) || !(Number(desc.episode) > 0)) return;
-    resolveTmdbJellyfinRowAsync({ method: 'tv', id: String(desc.id) })
-      .then(function (row) {
-        if (!row || !row.id) return;
-        return tmdbSyncSeriesEpisodes(row.id).then(function () {
-          if (!tmdbSyncShouldPush(hash, 100)) return;
-          var epRow = tmdbFindEpisodeRow(row, desc.season, desc.episode);
-          if (!epRow || !epRow.id) return;
-          tmdbPushItemPlayed(epRow.id, hash);
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbPushUnwatchedDesc(desc) {
-    if (!desc || !desc.id) return;
-    var hash = desc.hash;
-    if (!tmdbSyncShouldPush(hash, 0)) return;
-    var method = desc.method || (desc.originalName ? 'tv' : 'movie');
-    if (method === 'movie') {
-      resolveTmdbJellyfinRowAsync({ method: 'movie', id: String(desc.id) })
-        .then(function (row) {
-          if (!row || !row.id) return;
-          if (!tmdbSyncShouldPush(hash, 0)) return;
-          tmdbPushItemUnplayed(row.id, hash);
-        })
-        .catch(function () { });
-      return;
-    }
-    if (!(Number(desc.season) > 0) || !(Number(desc.episode) > 0)) return;
-    resolveTmdbJellyfinRowAsync({ method: 'tv', id: String(desc.id) })
-      .then(function (row) {
-        if (!row || !row.id) return;
-        return tmdbSyncSeriesEpisodes(row.id).then(function () {
-          if (!tmdbSyncShouldPush(hash, 0)) return;
-          var epRow = tmdbFindEpisodeRow(row, desc.season, desc.episode);
-          if (!epRow || !epRow.id) return;
-          tmdbPushItemUnplayed(epRow.id, hash);
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbFindEpisodeRow(seriesRow, season, episode) {
-    var rows = (tmdbSync.episodesCache[seriesRow.id] && tmdbSync.episodesCache[seriesRow.id].rows) || [];
-    for (var i = 0; i < rows.length; i++) {
-      var n = episodeNumbers(rows[i].raw);
-      if (n.season === Number(season) && n.episode === Number(episode)) return rows[i];
-    }
-    return null;
-  }
-
-  function tmdbSyncDescriptor(hash, method, id, season, episode) {
-    if (!hash || !id) return;
-    for (var i = 0; i < tmdbSync.active.length; i++) {
-      if (String(tmdbSync.active[i].hash) === String(hash)) {
-        tmdbSync.active[i].method = method;
-        tmdbSync.active[i].id = String(id);
-        if (season !== undefined) tmdbSync.active[i].season = season;
-        if (episode !== undefined) tmdbSync.active[i].episode = episode;
-        return;
-      }
-    }
-    tmdbSync.active.push({ hash: String(hash), method: method, id: String(id), season: season, episode: episode });
-    if (tmdbSync.active.length > 40) tmdbSync.active.splice(0, tmdbSync.active.length - 40);
-  }
-
-  function tmdbSyncDescriptorByHash(hash) {
-    if (!hash) return null;
-    for (var i = 0; i < tmdbSync.active.length; i++) {
-      if (String(tmdbSync.active[i].hash) === String(hash)) return tmdbSync.active[i];
-    }
-    return null;
-  }
-
-  function tmdbSyncPlayCard(data) {
-    if (!data) return null;
-    var card = data.card || data.movie ||
-      (data.element && (data.element.card || data.element.movie)) || null;
-    if (!card || typeof card !== 'object' || card.ProviderIds || card.jellyfinId) return null;
-    return card;
-  }
-
-  function tmdbSyncPlayNumbers(data, card) {
-    var season = Number(data && (data.season_number != null ? data.season_number : data.season));
-    var episode = Number(data && (data.episode_number != null ? data.episode_number : data.episode));
-    if ((!season || !episode) && card) {
-      season = Number(card.season_number != null ? card.season_number : card.season);
-      episode = Number(card.episode_number != null ? card.episode_number : card.episode);
-    }
-    if (!season || !episode) return null;
-    return { season: season, episode: episode };
-  }
-
-  function tmdbSyncPlayTmdb(data, card) {
-    if (!card || !card.id) return null;
-    var method = String(card.method || data.method || card.media_type || '').toLowerCase();
-    if (method !== 'movie' && method !== 'tv') {
-      method =
-        card.name || card.original_name || card.first_air_date ||
-        card.number_of_seasons || tmdbSyncPlayNumbers(data, card) ? 'tv' : 'movie';
-    }
-    return { method: method, id: String(card.id) };
-  }
-
-  function tmdbSyncRegisterPlayData(data) {
-    try {
-      if (!tmdbSyncEnabled() || !data || data.jellyfinPlayback || data.jellyfinId) return;
-    } catch (e) { return; }
-    var card = tmdbSyncPlayCard(data);
-    var tmdb = tmdbSyncPlayTmdb(data, card);
-    if (!tmdb || !card) return;
-    var numbers = tmdbSyncPlayNumbers(data, card);
-    var title = card.original_name || card.originalTitle || card.original_title || '';
-    if (tmdb.method === 'tv' && numbers) {
-      var orig = title || card.title || '';
-      if (orig) {
-        tmdbSyncDescriptor(tmdbEpisodeHash(orig, numbers.season, numbers.episode), 'tv', tmdb.id, numbers.season, numbers.episode);
-      }
-      return;
-    }
-    if (tmdb.method === 'movie' && (card.original_title || card.originalTitle)) {
-      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', tmdb.id);
-    }
-  }
-
-  function tmdbSyncSyncSeriesFromJellyfin(row) {
-    if (!tmdbSyncEnabled() || !row || !row.id || !row.tmdb) return Promise.resolve();
-    return tmdbSyncSeriesEpisodes(row.id)
-      .then(function (rows) {
-        var wants = rows.filter(function (r) {
-          return r.raw &&
-            (r.watched ||
-              Number(r.playedPct) >= 90 ||
-              !!(r.raw.UserData && r.raw.UserData.Played));
-        });
-        if (!wants.length) return;
-        return tmdbSyncFetchMeta(row.tmdb).then(function (meta) {
-          var name = meta && (meta.originalName || meta.originalTitle);
-          if (!name) return;
-          wants.forEach(function (r) {
-            var n = episodeNumbers(r.raw);
-            if (n.season && n.episode) {
-              tmdbSyncWriteHash(tmdbEpisodeHash(name, n.season, n.episode), 100);
-            }
-          });
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncRegisterSeriesDescriptors(tmdb, seriesRow) {
-    if (!tmdb || String(tmdb.method) !== 'tv' || !seriesRow || !seriesRow.id) return Promise.resolve();
-    return tmdbSyncFetchMeta(tmdb)
-      .then(function (meta) {
-        var name = meta && (meta.originalName || meta.originalTitle);
-        if (!name) return;
-        return tmdbSyncSeriesEpisodes(seriesRow.id).then(function (rows) {
-          (rows || []).forEach(function (r) {
-            if (!r.raw) return;
-            var n = episodeNumbers(r.raw);
-            if (n.season && n.episode) {
-              tmdbSyncDescriptor(
-                tmdbEpisodeHash(name, n.season, n.episode),
-                'tv',
-                String(tmdb.id),
-                n.season,
-                n.episode
-              );
-            }
-          });
-        });
-      })
-      .catch(function () { });
-  }
-
-  function tmdbSyncRegisterCard(object) {
-    try {
-      if (!tmdbSyncEnabled() || !object) return;
-    } catch (e) { return; }
-    var method = String(object.method || '');
-    var id = String(object.id || (object.card && object.card.id) || '');
-    var isJellyfin = !!(
-      object.jellyfinRow ||
-      object.source === 'jellyfin' ||
-      (object.card && object.card.source === 'jellyfin')
-    );
-    if (isJellyfin || !method || !id) return;
-    var card = object.card || object;
-    if (method === 'movie' && (card.original_title || card.originalTitle)) {
-      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', id);
-      resolveTmdbJellyfinRowAsync({ method: 'movie', id: id })
-        .then(function (resolved) {
-          if (resolved && resolved.tmdb) {
-            try {
-              tmdbSyncApplyResumeForRow(resolved);
-            } catch (err) { }
-          }
-        })
-        .catch(function () { });
-      return;
-    }
-    if (method === 'tv') {
-      resolveTmdbJellyfinRowAsync({ method: 'tv', id: id })
-        .then(function (resolved) {
-          if (resolved && resolved.tmdb) {
-            tmdbSyncRegisterSeriesDescriptors({ method: 'tv', id: id }, resolved);
-            try {
-              tmdbSyncSyncSeriesFromJellyfin(resolved);
-            } catch (err) { }
-            try {
-              tmdbSyncApplyResumeForRow(resolved);
-            } catch (err) { }
-          }
-        })
-        .catch(function () { });
-    }
-  }
-
-  function tmdbSyncRegisterPlayerItem(item) {
-    try {
-      if (!tmdbSyncEnabled() || !item || item.jellyfinId) return;
-    } catch (e) { return; }
-    var card = (item && (item.card || (item.data && item.data.card))) || null;
-    if (!card || !card.id) return;
-    var id = String(card.id);
-    var season = item.season != null ? Number(item.season) : 0;
-    var episode = item.episode != null ? Number(item.episode) : 0;
-    var title = card.original_name || card.originalTitle || card.original_title || '';
-    if (season > 0 && episode > 0 && (title || card.title)) {
-      var orig = title || card.title || '';
-      tmdbSyncDescriptor(tmdbEpisodeHash(orig, season, episode), 'tv', id, season, episode);
-      return;
-    }
-    if (card.original_title || card.originalTitle) {
-      tmdbSyncDescriptor(tmdbMovieHash(card.original_title || card.originalTitle), 'movie', id);
-    }
-  }
-
-  function tmdbSyncBeginJfMirror(row) {
-    try {
-      if (!tmdbSyncEnabled() || !row || !row.raw) return;
-      var type = String(row.type || row.raw.Type || '');
-      tmdbSync.jfPlaybackActive = true;
-      tmdbSync.jfPlaybackRowId = String(row.raw.Id || '');
-      var tmdb = tmdbFromItem(row.raw);
-      var seriesResolvePromise;
-      if (type === 'Episode') {
-        var seriesId = row.raw.SeriesId;
-        if (!seriesId) return;
-        seriesResolvePromise = tmdbSyncResolveSeriesRowAsync(seriesId).then(function (sr) {
-          return (sr && sr.tmdb) || tmdb || null;
-        });
-      } else {
-        seriesResolvePromise = Promise.resolve(tmdb || null);
-      }
-      seriesResolvePromise
-        .then(function (seriesTmdb) {
-          if (!seriesTmdb) return null;
-          return tmdbSyncFetchMeta(seriesTmdb);
-        })
-        .then(function (meta) {
-          if (type === 'Episode') {
-            var numbers = episodeNumbers(row.raw);
-            var name = meta && (meta.originalName || meta.originalTitle);
-            if (!name || !numbers.season || !numbers.episode) return;
-            tmdbSync.jfActiveHash = String(tmdbEpisodeHash(name, numbers.season, numbers.episode));
-          } else {
-            var mname = meta && meta.originalTitle;
-            if (!mname) return;
-            tmdbSync.jfActiveHash = String(tmdbMovieHash(mname));
-          }
-          tmdbSync.jfLastWriteAt = 0;
-        })
-        .catch(function () { });
-    } catch (e) { }
-  }
-
-  function tmdbSyncClearJfMirror() {
-    tmdbSync.jfActiveHash = '';
-    tmdbSync.jfLastWriteAt = 0;
-    tmdbSync.jfPlaybackActive = false;
-    tmdbSync.jfPlaybackRowId = '';
-  }
-
-  function tmdbSyncApplyRealtimeMirror(pct, tsec, dsec) {
-    if (!tmdbSyncEnabled()) return;
-    var hash = tmdbSync.jfActiveHash;
-    if (!hash || !Lampa.Timeline || typeof Lampa.Timeline.update !== 'function') return;
-    var now = Date.now();
-    if (now - (tmdbSync.jfLastWriteAt || 0) < TMDB_MIRROR_INTERVAL_MS) return;
-    var dur = Number(dsec) || 0;
-    var t = Number(tsec) || 0;
-    if (dur <= 0 || t <= 0) return;
-    tmdbSync.jfLastWriteAt = now;
-    tmdbSyncWriteTmdb(hash, now, pct, t, dur, true);
-  }
-
-  function tmdbSyncOnTimelineUpdate(e) {
-    if (!tmdbSyncEnabled()) return;
-    if (!e || !e.data) return;
-    var hash = String(e.data.hash || '');
-    if (!hash) return;
-    if (tmdbSync.jfPlaybackActive) return;
-    if (String(hash) === String(syncingTimelineHash || '')) return;
-    if (String(hash) === String(currentTimelineHash || '')) return;
-    if (tmdbSync.jfActiveHash && String(hash) === String(tmdbSync.jfActiveHash)) return;
-    var road = e.data.road || {};
-    var pct = Number(road.percent) || 0;
-    if (tmdbSyncGuardHit(hash, pct)) return;
-    var desc = tmdbSyncDescriptorByHash(hash);
-    if (!desc && readPlaydata) {
-      var pd = readPlaydata();
-      if (pd) {
-        tmdbSyncRegisterPlayData(pd.item || pd);
-        tmdbSyncRegisterPlayerItem(pd.item || pd);
-      }
-      desc = tmdbSyncDescriptorByHash(hash);
-    }
-    if (!desc) return;
-    if (pct >= 90) {
-      tmdbSyncStopSession(true);
-      tmdbPushWatchedDesc(desc);
-    } else if (pct === 0) {
-      if (!tmdbSyncPlayerActive()) {
-        tmdbSyncStopSession(false);
-        tmdbPushUnwatchedDesc(desc);
-      }
-    } else {
-      tmdbSyncReportSession(desc, Number(road.time) || 0, Number(road.duration) || 0);
-    }
-  }
-
-  function tmdbSyncPlayerActive() {
-    try {
-      if (Lampa.Player && typeof Lampa.Player.playdata === 'function') {
-        var w = Lampa.Player.playdata();
-        return !!(w && typeof w === 'object');
-      }
-    } catch (e) { }
-    return false;
-  }
-
   var initDone = false;
   function init() {
     if (initDone) return;
@@ -14978,6 +13080,7 @@
     setupBackAfterRefresh();
     setupRouteRestore();
     listenFullCard();
+    registerTimelineListener();
 
     if (!jellyfinResumeHandled) {
       resumeJellyfinActivity();
@@ -14995,36 +13098,30 @@
 
     if (Lampa.Player && Lampa.Player.listener) {
       Lampa.Player.listener.follow('destroy', handlePlayerDestroy);
-      Lampa.Player.listener.follow('end', handlePlayerDestroy);
-      Lampa.Player.listener.follow('finish', handlePlayerDestroy);
-      Lampa.Player.listener.follow('start', tmdbSyncRegisterPlayData);
+      Lampa.Player.listener.follow('end', function () {
+        markPlaybackFinished();
+        handlePlayerDestroy();
+      });
+      Lampa.Player.listener.follow('finish', function () {
+        markPlaybackFinished();
+        handlePlayerDestroy();
+      });
       Lampa.Player.listener.follow('ready', function (e) {
         var item = (e && (e.item || e.data)) || e || {};
-        tmdbSyncRegisterPlayerItem(item);
         if (item && item.jellyfinId) {
-          lastCompletedRowId = null;
-          lastProgressResetRowId = null;
-          if (lastProgressResetTimer) {
-            clearTimeout(lastProgressResetTimer);
-            lastProgressResetTimer = null;
-          }
           currentPlayItemId = item.jellyfinId;
           var readyRow = findPlaybackRow(item.jellyfinId);
           if (readyRow) {
             currentPlayRow = readyRow;
-            currentTimelineHash = timelineHashFor(readyRow) || currentTimelineHash;
-            try {
-              tmdbSyncBeginJfMirror(readyRow);
-            } catch (err) { }
           }
           if (externalPlay && !usesLampaNativePlayer()) {
             var readyRow = findPlaybackRow(item.jellyfinId);
             if (readyRow && readyRow.raw) {
               externalPlay.rowId = readyRow.raw.Id;
               externalPlay.type = String(readyRow.type || readyRow.raw.Type || '');
-              externalPlay.resumeSec = Math.max(0, Number(readyRow.resumeSec) || 0);
+              externalPlay.resumeSec = Number(readyRow.resumeSec) || 0;
               externalPlay.durationSec = Math.round((Number(readyRow.raw.RunTimeTicks) || 0) / 10000000);
-              externalPlay.anchorTime = Math.max(0, Number(readyRow.resumeSec) || 0);
+              externalPlay.anchorTime = 0;
               externalPlay.anchorAt = Date.now();
             }
             externalPlay.startAt = Date.now();
@@ -15050,97 +13147,12 @@
       });
     }
 
-    if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
-      Lampa.PlayerVideo.listener.follow('pause', function () {
-        tmdbSync.sessionPaused = true;
-      });
-      Lampa.PlayerVideo.listener.follow('play', function () {
-        tmdbSync.sessionPaused = false;
-      });
-    }
-
     installQualitySwitchHandler();
     installJellyfinPlaylist();
     disablePlayerDownPlaylist();
 
-    if (Lampa.Timeline && Lampa.Timeline.listener) {
-      Lampa.Timeline.listener.follow('update', function (e) {
-        if (!e || !e.data) return;
-        if (String(e.data.hash || '') !== String(currentTimelineHash || '')) return;
-        if (String(e.data.hash || '') === String(syncingTimelineHash || '')) return;
-        if (!currentPlayRow) return;
-        var road = e.data.road || {};
-        cachePlaybackState(
-          currentPlayRow.raw.Id,
-          String(currentPlayRow.type || currentPlayRow.raw.Type || ''),
-          road.percent,
-          road.time,
-          road.duration
-        );
-        reportPlaybackProgress(
-          currentPlayRow,
-          road.percent,
-          road.time,
-          road.duration
-        );
-      });
-
-      Lampa.Timeline.listener.follow('update', tmdbSyncOnTimelineUpdate);
-    }
-
-    if (document.addEventListener) {
-      document.addEventListener('seeked', handleVideoSeeked, true);
-      document.addEventListener('ended', handleVideoEnded, true);
-      document.addEventListener('pause', handleMediaPause, true);
-      document.addEventListener('play', handleMediaPlay, true);
-    }
-
-    installRealtimeProgress();
-
-    try {
-      var onAppHidden = function () {
-        stopExternalPlaybackTicker();
-        terminateJfPlayback();
-        rtIsPaused = false;
-        resetExternalPauseTracking();
-      };
-      window.addEventListener('pagehide', onAppHidden);
-      window.addEventListener('beforeunload', onAppHidden);
-      window.addEventListener('unload', onAppHidden);
-      if (document.addEventListener) {
-        document.addEventListener('visibilitychange', function () {
-          if (document.visibilityState === 'hidden') {
-            syncFlushPlaybackProgress(true);
-          } else if (document.visibilityState === 'visible') {
-            if (externalPlay && externalPlay.rowId) {
-              syncFlushPlaybackProgress(true);
-              reAnchorExternalFromPlayer();
-              startExternalPlaybackTicker();
-              restoreAndroidSeriesBackRoot();
-            }
-          }
-        });
-        document.addEventListener('webkitvisibilitychange', function () {
-          if (document.webkitVisibilityState === 'hidden') {
-            syncFlushPlaybackProgress(true);
-          } else if (document.webkitVisibilityState === 'visible') {
-            if (externalPlay && externalPlay.rowId) {
-              syncFlushPlaybackProgress(true);
-              reAnchorExternalFromPlayer();
-              startExternalPlaybackTicker();
-              restoreAndroidSeriesBackRoot();
-            }
-          }
-        });
-        document.addEventListener('freeze', onAppHidden);
-      }
-    } catch (e) { }
-
     prefetchAutoUser();
     refreshLibraryIndex(false)
-      .then(function () {
-        scheduleTmdbSyncFromLibrary();
-      })
       .catch(function () { });
   }
 
