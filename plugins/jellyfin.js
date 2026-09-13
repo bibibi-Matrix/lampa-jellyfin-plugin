@@ -4,7 +4,7 @@
   if (window.__jellyfinPlugin_loaded) return;
   window.__jellyfinPlugin_loaded = true;
 
-  var JELLYFIN_BUILD = 'Beta 18 (20260831)';
+  var JELLYFIN_BUILD = 'Beta 19 (20260913)';
 
   var STORAGE_PREFIX = 'jellyfin';
   var SETTINGS_COMPONENT = STORAGE_PREFIX;
@@ -759,10 +759,10 @@
     var url = base + (p.charAt(0) === '/' ? p : '/' + p);
     if (!isLogin) {
       var sep = url.indexOf('?') >= 0 ? '&' : '?';
-      if (url.indexOf('api_key=') < 0) url += sep + 'api_key=' + encodeURIComponent(key);
+      if (url.indexOf('ApiKey=') < 0) url += sep + 'ApiKey=' + encodeURIComponent(key);
     }
     var headers = {};
-    if (isLogin && key) headers['X-Emby-Token'] = key;
+    if (isLogin) headers['Authorization'] = jfAuthHeader(key);
 
     var timeout = typeof opts.timeout === 'number' ? opts.timeout : HTTP_TIMEOUT_MS;
     var dataType = opts.dataType || 'json';
@@ -1179,7 +1179,7 @@
       encodeURIComponent(id) +
       '/Images/Primary?maxHeight=500&tag=' +
       encodeURIComponent(tag) +
-      '&api_key=' +
+      '&ApiKey=' +
       encodeURIComponent(apiKey())
     );
   }
@@ -1194,7 +1194,7 @@
         encodeURIComponent(item.Id) +
         '/Images/Primary?maxHeight=360&tag=' +
         encodeURIComponent(item.ImageTags.Primary) +
-        '&api_key=' +
+        '&ApiKey=' +
         encodeURIComponent(key)
       );
     }
@@ -1205,7 +1205,7 @@
         encodeURIComponent(item.SeriesId) +
         '/Images/Primary?maxHeight=360&tag=' +
         encodeURIComponent(item.SeriesPrimaryImageTag) +
-        '&api_key=' +
+        '&ApiKey=' +
         encodeURIComponent(key)
       );
     }
@@ -1216,7 +1216,7 @@
         encodeURIComponent(item.SeriesId) +
         '/Images/Thumb?maxHeight=360&tag=' +
         encodeURIComponent(item.SeriesThumbImageTag) +
-        '&api_key=' +
+        '&ApiKey=' +
         encodeURIComponent(key)
       );
     }
@@ -1231,7 +1231,7 @@
       encodeURIComponent(item.SeriesId) +
       '/Images/Primary?maxHeight=500&tag=' +
       encodeURIComponent(item.SeriesPrimaryImageTag) +
-      '&api_key=' +
+      '&ApiKey=' +
       encodeURIComponent(apiKey())
     );
   }
@@ -1295,7 +1295,7 @@
       dataType: 'json',
       headers: {
         'Content-Type': 'application/json',
-        'X-Emby-Authorization': authHeader,
+        'Authorization': authHeader,
       },
     };
 
@@ -1361,13 +1361,18 @@
     });
   }
 
-  function qcAuthHeader() {
+  function jfAuthHeader(token) {
     var deviceId = getDeviceId();
-    return (
+    var h =
       'MediaBrowser Client="Lampa", Device="Lampa", DeviceId="' +
       deviceId +
-      '", Version="1.3.0"'
-    );
+      '", Version="1.3.0"';
+    if (token) h += ', Token="' + token + '"';
+    return h;
+  }
+
+  function qcAuthHeader() {
+    return jfAuthHeader('');
   }
 
   function qcHttp(url, postData, headers) {
@@ -1407,9 +1412,9 @@
   function qcInitiate() {
     return qcHttp(
       apiBase() + '/QuickConnect/Initiate',
-      null,
+      '{}',
       {
-        'X-Emby-Authorization': qcAuthHeader(),
+        'Authorization': qcAuthHeader(),
         'Content-Type': 'application/json',
       }
     );
@@ -1456,8 +1461,8 @@
     if (!token) return Promise.resolve();
     return qcHttp(
       apiBase() + '/Sessions/Logout',
-      null,
-      { 'X-Emby-Token': token }
+      '{}',
+      { 'Authorization': jfAuthHeader(token) }
     ).catch(function () {
       return null;
     });
@@ -1931,7 +1936,7 @@
     var parts = [
       'DeviceId=' + encodeURIComponent(getDeviceId()),
       'MediaSourceId=' + encodeURIComponent(mediaSourceId(msId)),
-      'api_key=' + encodeURIComponent(apiKey()),
+      'ApiKey=' + encodeURIComponent(apiKey()),
     ];
     if (opts.userId) parts.push('UserId=' + encodeURIComponent(opts.userId));
     if (opts.playSessionId) parts.push('PlaySessionId=' + encodeURIComponent(opts.playSessionId));
@@ -1994,7 +1999,7 @@
     var parts = [
       'DeviceId=' + encodeURIComponent(getDeviceId()),
       'MediaSourceId=' + encodeURIComponent(mediaSourceId(msId)),
-      'api_key=' + encodeURIComponent(apiKey()),
+      'ApiKey=' + encodeURIComponent(apiKey()),
     ];
     if (opts.userId) parts.push('UserId=' + encodeURIComponent(opts.userId));
     if (opts.playSessionId) parts.push('PlaySessionId=' + encodeURIComponent(opts.playSessionId));
@@ -2024,7 +2029,7 @@
     var parts = [
       'DeviceId=' + encodeURIComponent(getDeviceId()),
       'MediaSourceId=' + encodeURIComponent(mediaSourceId(msId)),
-      'api_key=' + encodeURIComponent(apiKey()),
+      'ApiKey=' + encodeURIComponent(apiKey()),
       'Static=true',
     ];
     if (userId) parts.push('UserId=' + encodeURIComponent(userId));
@@ -2239,7 +2244,7 @@
       encodeURIComponent(index) +
       '/Stream.' +
       fmt +
-      '?api_key=' +
+      '?ApiKey=' +
       encodeURIComponent(apiKey())
     );
   }
@@ -4455,7 +4460,7 @@
       encodeURIComponent(library.Id) +
       '/Images/Primary?maxHeight=280&tag=' +
       encodeURIComponent(tag) +
-      '&api_key=' +
+      '&ApiKey=' +
       encodeURIComponent(apiKey())
     );
   }
@@ -4793,7 +4798,7 @@
       (opts.maxWidth || 1280) +
       '&maxHeight=' +
       (opts.maxHeight || 720) +
-      '&quality=90&api_key=' +
+      '&quality=90&ApiKey=' +
       encodeURIComponent(apiKey())
     );
   }
@@ -4902,7 +4907,7 @@
         encodeURIComponent(raw.BackdropItemId || raw.Id) +
         '/Images/Backdrop?tag=' +
         encodeURIComponent(raw.BackdropImageTags[0]) +
-        '&api_key=' +
+        '&ApiKey=' +
         encodeURIComponent(apiKey());
     }
     var movie = {
@@ -4956,7 +4961,7 @@
       (person.PrimaryImageTag
         ? '&tag=' + encodeURIComponent(person.PrimaryImageTag)
         : '') +
-      '&quality=90&api_key=' +
+      '&quality=90&ApiKey=' +
       encodeURIComponent(key)
     );
   }
@@ -7808,7 +7813,7 @@
         '/Items/' +
         encodeURIComponent(id) +
         '/Images/Primary?maxWidth=3840&maxHeight=2160&quality=90' +
-        '&api_key=' +
+        '&ApiKey=' +
         encodeURIComponent(apiKey())
       );
     }
@@ -7825,7 +7830,7 @@
         parts.pop();
         itemFolder = parts.join('/');
       }
-      var libUrl = '/Users/' + encodeURIComponent(userId) + '/Views?api_key=' + encodeURIComponent(apiKey());
+      var libUrl = '/Users/' + encodeURIComponent(userId) + '/Views?ApiKey=' + encodeURIComponent(apiKey());
       return jfHttp(libUrl).then(function (views) {
         var libs = (views && views.Items) || [];
         var photoLibs = [];
@@ -8084,7 +8089,7 @@
 
     function imageSrc(row) {
       var base = photoImageUrl(row);
-      if (base && base.indexOf('api_key=') !== -1) base += '&cache_bust=' + imgBust;
+      if (base && base.indexOf('ApiKey=') !== -1) base += '&cache_bust=' + imgBust;
       return base;
     }
 
@@ -8546,7 +8551,7 @@
       if (imgFailCount >= 2) return;
       imgFailCount++;
       var src = photoImageUrl(currentPhoto());
-      if (src && src.indexOf('api_key=') !== -1) {
+      if (src && src.indexOf('ApiKey=') !== -1) {
         $img.attr('src', src + '&cache_bust=' + Date.now() + '-' + imgFailCount);
       }
     });
